@@ -5,12 +5,9 @@ import time
 # 모자이크 토글 변수
 enable_blur = True
 
-# 얼굴 탐지 모델 경로
-prototxt = "deploy.prototxt"
-weights = "res10_300x300_ssd_iter_140000.caffemodel"
-
-# 얼굴 인식 네트워크 로딩
-net = cv2.dnn.readNetFromCaffe(prototxt, weights)
+# OpenCV 내장 얼굴 탐지 모델 경로
+cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+face_cascade = cv2.CascadeClassifier(cascade_path)
 
 # 웹캠 시작
 cap = cv2.VideoCapture(0)
@@ -38,21 +35,13 @@ while True:
         break
     frame = cv2.flip(frame, 1)
 
-    h, w = frame.shape[:2]
-    blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104, 177, 123))
-    net.setInput(blob)
-    detections = net.forward()
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
 
     # 얼굴 탐지 반복
-    for i in range(detections.shape[2]):
-        confidence = detections[0, 0, i, 2]
-        if confidence < 0.3:
-            continue
-
-        box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-        (startX, startY, endX, endY) = box.astype("int")
-
-        # ROI 추출 및 픽셀화
+    for (startX, startY, w, h) in faces:
+        endX = startX + w
+        endY = startY + h
         face = frame[startY:endY, startX:endX]
         if enable_blur:
             face = anonymize_face_pixelate(face, blocks=15)
@@ -64,11 +53,7 @@ while True:
                 1.0, (0, 255, 0) if enable_blur else (0, 0, 255), 2)
 
     # 탐지된 얼굴 수 표시
-    face_count = 0
-    for i in range(detections.shape[2]):
-        confidence = detections[0, 0, i, 2]
-        if confidence >= 0.5:
-            face_count += 1
+    face_count = len(faces)
     cv2.putText(frame, f"Faces: {face_count}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
                 1.0, (255, 255, 255), 2)
 
