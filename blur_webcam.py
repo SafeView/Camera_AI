@@ -1,23 +1,53 @@
 import cv2
 import numpy as np
-import time
+import subprocess
+
+# 입력(프론트 서버에서 송출하는 RTMP/RTSP 등)과 출력(프론트 서버로 송출) 주소
+input_url = "rtmp://localhost/live/input"  # 프론트 서버에서 송출하는 주소
+output_url = "rtmp://localhost/live/output"  # 프론트 서버로 다시 송출할 주소
+fps = 30
 
 # 모자이크 토글 변수
 enable_blur = True
 
-# OpenCV 내장 얼굴 탐지 모델 경로
-cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-face_cascade = cv2.CascadeClassifier(cascade_path)
 
-# 웹캠 시작
-cap = cv2.VideoCapture(0)
-time.sleep(2.0)  # 카메라 워밍업
+# AI_processor 모듈 import
+from AI_processor import process_frame
+
+import time
+# 입력 스트림이 연결될 때까지 대기
+while True:
+    cap = cv2.VideoCapture(input_url)
+    ret, frame = cap.read()
+    if ret:
+        print("입력 스트림 연결 성공.")
+        break
+    print("입력 스트림 대기 중... (1초 후 재시도)")
+    cap.release()
+    time.sleep(1)
+height, width = frame.shape[:2]
+
+# ffmpeg 송출 프로세스 준비
+ffmpeg_cmd = [
+    'ffmpeg',
+    '-y',
+    '-f', 'rawvideo',
+    '-vcodec', 'rawvideo',
+    '-pix_fmt', 'bgr24',
+    '-s', f'{width}x{height}',
+    '-r', str(int(fps)),
+    '-i', '-',
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-f', 'flv',
+    output_url
+]
+proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
 
 def anonymize_face_pixelate(image, blocks=20):
     (h, w) = image.shape[:2]
     xSteps = np.linspace(0, w, blocks + 1, dtype="int")
     ySteps = np.linspace(0, h, blocks + 1, dtype="int")
-
     for i in range(1, len(ySteps)):
         for j in range(1, len(xSteps)):
             startX = xSteps[j - 1]
@@ -29,46 +59,17 @@ def anonymize_face_pixelate(image, blocks=20):
             cv2.rectangle(image, (startX, startY), (endX, endY), (B, G, R), -1)
     return image
 
+
 while True:
     ret, frame = cap.read()
     if not ret:
         break
-    frame = cv2.flip(frame, 1)
+    # frame = cv2.flip(frame, 1)  # 필요시 사용
+    if enable_blur:
+        frame = process_frame(frame, mode="face_plate")
+    # 프레임을 프론트 서버로 송출
+    proc.stdin.write(frame.tobytes())
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-
-    # 얼굴 탐지 반복
-    for (startX, startY, w, h) in faces:
-        endX = startX + w
-        endY = startY + h
-        face = frame[startY:endY, startX:endX]
-        if enable_blur:
-            face = anonymize_face_pixelate(face, blocks=15)
-        frame[startY:endY, startX:endX] = face
-
-    # 모자이크 상태 표시 텍스트
-    status_text = "Blur ON" if enable_blur else "Blur OFF"
-    cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                1.0, (0, 255, 0) if enable_blur else (0, 0, 255), 2)
-
-    # 탐지된 얼굴 수 표시
-    face_count = len(faces)
-    cv2.putText(frame, f"Faces: {face_count}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
-                1.0, (255, 255, 255), 2)
-
-    cv2.imshow("SafeView", frame)
-
-    key = cv2.waitKey(1) & 0xFF
-
-    # 'b' 키를 누르면 모자이크 토글
-    if key == ord('b'):
-        enable_blur = not enable_blur
-
-    # 'q' 키로 종료
-    if key == ord('q'):
-        break
-
-# 종료
 cap.release()
-cv2.destroyAllWindows()
+proc.stdin.close()
+proc.wait()
