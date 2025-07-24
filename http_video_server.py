@@ -18,6 +18,23 @@ async def video_ws(websocket: WebSocket):
             data = await websocket.receive_bytes()
             nparr = np.frombuffer(data, np.uint8)
             frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            # 모자이크 적용하지 않음
+            _, jpg = cv2.imencode('.jpg', frame)
+            await websocket.send_bytes(jpg.tobytes())
+    except Exception as e:
+        print("WebSocket closed:", e)
+    finally:
+        active_websockets.discard(websocket)
+
+@app.websocket("/ws/video/mo")
+async def video_mosaic_ws(websocket: WebSocket):
+    await websocket.accept()
+    active_websockets.add(websocket)
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            nparr = np.frombuffer(data, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             frame = process_frame(frame, mode="face_plate")
             _, jpg = cv2.imencode('.jpg', frame)
             await websocket.send_bytes(jpg.tobytes())
