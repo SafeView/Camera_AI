@@ -138,7 +138,8 @@ async def start_recording():
             return {
                 "status": "Recording started (저장: S3)", 
                 "filename": recording_filename,
-                "storage": "S3"
+                "storage": "S3",
+                "error": "no error"
             }
         else:
             return {"error": "Failed to start recording"}
@@ -187,7 +188,8 @@ async def stop_recording():
                         "status": "Recording stopped and uploaded to S3", 
                         "filename": recording_filename,
                         "s3_url": result,
-                        "storage": "S3"
+                        "storage": "S3",
+                        "error" : "no error"
                     }
                 else:
                     return {
@@ -249,7 +251,7 @@ async def get_recording_url(filename: str):
             ExpiresIn=3600  # 1시간
         )
         
-        return {"url": url, "filename": filename, "storage": "S3"}
+        return {"url": url, "filename": filename, "storage": "S3", "error": "no error"}
     
     except Exception as e:
         if hasattr(e, 'response') and e.response['Error']['Code'] == '404':
