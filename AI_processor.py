@@ -58,3 +58,4 @@ def process_frame(frame, mode="face_plate"):
         return detect_and_blur(frame, blur_face=True, blur_plate=True)
     else:
         return frame
+
