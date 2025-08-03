@@ -75,6 +75,17 @@ if USE_S3:
 else:
     print("S3 환경변수가 설정되지 않음")
 
+# S3 업로드 함수
+def upload_to_s3(file_path, filename):
+    if not USE_S3 or not s3_client:
+        return False, "S3 not configured"
+    
+    try:
+        s3_client.upload_file(file_path, S3_BUCKET_NAME, f"recordings/{filename}")
+        return True, f"https://{S3_BUCKET_NAME}.s3.{S3_REGION}.amazonaws.com/recordings/{filename}"
+    except Exception as e:
+        return False, str(e)
+
 # 키 검증 함수
 async def verify_key_with_backend(access_token: str, camera_id: str):
     """백엔드 API로 키 검증 요청"""
@@ -290,17 +301,6 @@ async def start_recording():
         else:
             return {"error": "Failed to start recording"}
 
-# S3 업로드 함수
-def upload_to_s3(file_path, filename):
-    if not USE_S3 or not s3_client:
-        return False, "S3 not configured"
-    
-    try:
-        s3_client.upload_file(file_path, S3_BUCKET_NAME, f"recordings/{filename}")
-        return True, f"https://{S3_BUCKET_NAME}.s3.{S3_REGION}.amazonaws.com/recordings/{filename}"
-    except Exception as e:
-        return False, str(e)
-
 # 녹화 중단 엔드포인트
 @app.post("/stop_recording")
 async def stop_recording():
@@ -437,28 +437,6 @@ async def disconnect_ws():
         "message": f"모든 WebSocket 연결이 해제되었습니다.",
         "disconnected": closed,
         "total_active_before": len(active_websockets)
-    }
-
-# 내 연결 정보 확인 (개별 사용자용)
-@app.get("/my_connection_info")
-async def get_my_connection_info():
-    """현재 활성 연결 정보 반환 (클라이언트가 자신의 WebSocket ID를 알 수 있음)"""
-    connection_list = []
-    with verification_lock:
-        for ws in active_websockets:
-            ws_id = id(ws)
-            user_info = verified_users.get(ws_id, {})
-            connection_list.append({
-                "websocket_id": ws_id,
-                "is_verified": user_info.get("is_verified", False),
-                "camera_id": user_info.get("camera_id"),
-                "decryption_token": user_info.get("decryption_token") is not None
-            })
-    
-    return {
-        "active_connections": connection_list,
-        "total_connections": len(connection_list),
-        "note": "POST /disconnect_ws 로 모든 연결 해제 가능"
     }
 
 # 현재 연결된 사용자 상태 확인
