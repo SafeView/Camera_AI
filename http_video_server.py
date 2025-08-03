@@ -1,8 +1,9 @@
 import cv2
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
 from AI_processor import process_frame
 import io
 import os
@@ -199,6 +200,17 @@ async def unified_video_ws(websocket: WebSocket):
                                     "message": verification_result["message"],
                                     "canDecrypt": False
                                 }))
+                        
+                        elif data.get("type") == "disconnect":
+                            # 개별 사용자 연결 해제 요청
+                            await websocket.send_text(json.dumps({
+                                "type": "disconnect_result",
+                                "success": True,
+                                "message": "연결이 해제됩니다."
+                            }))
+                            # WebSocket 연결 종료
+                            await websocket.close()
+                            break
                     
                     except json.JSONDecodeError:
                         await websocket.send_text(json.dumps({
@@ -403,17 +415,51 @@ async def recording_status():
         "s3_configured": USE_S3
     }
 
-# HTTP 엔드포인트로 모든 WebSocket 연결 해제
+# HTTP 엔드포인트로 모든 WebSocket 연결 해제 (관리자용)
 @app.post("/disconnect_ws")
 async def disconnect_ws():
+    """
+    모든 WebSocket 연결 해제 (관리자용)
+    """
+    print("모든 WebSocket 연결 해제 실행")
     closed = 0
+    
     for ws in list(active_websockets):
         try:
             await ws.close()
             closed += 1
+            print(f"WebSocket 연결 해제 성공 - ID: {id(ws)}")
         except Exception as e:
             print(f"WebSocket close error: {e}")
-    return {"disconnected": closed}
+    
+    return {
+        "success": True,
+        "message": f"모든 WebSocket 연결이 해제되었습니다.",
+        "disconnected": closed,
+        "total_active_before": len(active_websockets)
+    }
+
+# 내 연결 정보 확인 (개별 사용자용)
+@app.get("/my_connection_info")
+async def get_my_connection_info():
+    """현재 활성 연결 정보 반환 (클라이언트가 자신의 WebSocket ID를 알 수 있음)"""
+    connection_list = []
+    with verification_lock:
+        for ws in active_websockets:
+            ws_id = id(ws)
+            user_info = verified_users.get(ws_id, {})
+            connection_list.append({
+                "websocket_id": ws_id,
+                "is_verified": user_info.get("is_verified", False),
+                "camera_id": user_info.get("camera_id"),
+                "decryption_token": user_info.get("decryption_token") is not None
+            })
+    
+    return {
+        "active_connections": connection_list,
+        "total_connections": len(connection_list),
+        "note": "POST /disconnect_ws 로 모든 연결 해제 가능"
+    }
 
 # 현재 연결된 사용자 상태 확인
 @app.get("/verification_status")
