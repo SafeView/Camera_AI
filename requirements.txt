@@ -1,2 +1,10 @@
 opencv-python
 numpy
+fastapi
+uvicorn
+boto3
+python-dotenv
+requests
+mysql-connector-python
+aiohttp
+websockets

@@ -1,8 +1,9 @@
 import cv2
 import numpy as np
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
 from AI_processor import process_frame
 import io
 import os
@@ -12,6 +13,9 @@ import boto3
 from botocore.exceptions import ClientError
 import tempfile
 from dotenv import load_dotenv
+import json
+import aiohttp
+import asyncio
 
 # .env 파일 로드
 load_dotenv()
@@ -29,6 +33,14 @@ app.add_middleware(
 
 # 연결된 WebSocket 추적용
 active_websockets = set()
+
+# 키 검증 관련 설정
+BACKEND_API_URL = os.getenv("BACKEND_API_URL", "http://localhost:8080")  # 백엔드 API URL
+AI_API_KEY = os.getenv("AI_API_KEY")  # AI API 키
+
+# 검증된 사용자별 모자이크 해제 상태 관리
+verified_users = {}  # {websocket_id: {"is_verified": bool, "decryption_token": str, "camera_id": str}}
+verification_lock = threading.Lock()
 
 # 녹화 관련 변수
 is_recording = False
@@ -63,55 +75,200 @@ if USE_S3:
 else:
     print("S3 환경변수가 설정되지 않음")
 
-# 인증된 공인(모자이크 해제) 연결 엔드포인트
-@app.websocket("/ws/video")
-async def video_ws(websocket: WebSocket):
-    global is_recording, video_writer, recording_filename
-    await websocket.accept()
-    active_websockets.add(websocket)
+# S3 업로드 함수
+def upload_to_s3(file_path, filename):
+    if not USE_S3 or not s3_client:
+        return False, "S3 not configured"
+    
     try:
-        while True:
-            data = await websocket.receive_bytes()
-            nparr = np.frombuffer(data, np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            # 모자이크 적용하지 않음
-            _, jpg = cv2.imencode('.jpg', frame)
-            
-            # 녹화 중이면 프레임 저장
-            with recording_lock:
-                if is_recording and video_writer is not None:
-                    video_writer.write(frame)
-            
-            await websocket.send_bytes(jpg.tobytes())
+        s3_client.upload_file(file_path, S3_BUCKET_NAME, f"recordings/{filename}")
+        return True, f"https://{S3_BUCKET_NAME}.s3.{S3_REGION}.amazonaws.com/recordings/{filename}"
     except Exception as e:
-        print("WebSocket closed:", e)
-    finally:
-        active_websockets.discard(websocket)
+        return False, str(e)
 
-# 일반 사용자(모자이크 적용) 연결 엔드포인트
-@app.websocket("/ws/video/mo")
-async def video_mosaic_ws(websocket: WebSocket):
+# 키 검증 함수
+async def verify_key_with_backend(access_token: str, camera_id: str):
+    """백엔드 API로 키 검증 요청"""
+    if not AI_API_KEY:
+        return {"success": False, "message": "AI API 키가 설정되지 않았습니다."}
+    
+    url = f"{BACKEND_API_URL}/api/decryption/keys/verify/ai"
+    headers = {
+        "AiApiKey": AI_API_KEY,
+        "Content-Type": "application/json"
+    }
+    data = {
+        "accessToken": access_token,
+        "cameraId": camera_id
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=data) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    return {"success": True, "data": result}
+                else:
+                    error_text = await response.text()
+                    return {"success": False, "message": f"키 검증 실패: {error_text}"}
+    except Exception as e:
+        return {"success": False, "message": f"백엔드 연결 오류: {str(e)}"}
+
+# 통합 비디오 WebSocket 엔드포인트
+@app.websocket("/ws/video")
+async def unified_video_ws(websocket: WebSocket):
     global is_recording, video_writer, recording_filename
     await websocket.accept()
+    websocket_id = id(websocket)
     active_websockets.add(websocket)
+    
+    # 초기 상태: 모자이크 적용 (미검증 상태)
+    with verification_lock:
+        verified_users[websocket_id] = {
+            "is_verified": False,
+            "decryption_token": None,
+            "camera_id": None
+        }
+    
     try:
         while True:
-            data = await websocket.receive_bytes()
-            nparr = np.frombuffer(data, np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            processed_frame = process_frame(frame, mode="face_plate")
-            _, jpg = cv2.imencode('.jpg', processed_frame)
-            
-            # 녹화 중이면 처리된 프레임 저장
-            with recording_lock:
-                if is_recording and video_writer is not None:
-                    video_writer.write(processed_frame)
-            
-            await websocket.send_bytes(jpg.tobytes())
+            try:
+                # 메시지 수신 (JSON 또는 바이너리)
+                message = await websocket.receive()
+                
+                if "text" in message:
+                    # JSON 메시지 처리 (키 검증 요청)
+                    try:
+                        data = json.loads(message["text"])
+                        if data.get("type") == "key_verification":
+                            access_token = data.get("accessToken")
+                            camera_id = data.get("cameraId")
+                            
+                            if not access_token or not camera_id:
+                                await websocket.send_text(json.dumps({
+                                    "type": "verification_result",
+                                    "success": False,
+                                    "message": "accessToken과 cameraId는 필수입니다."
+                                }))
+                                continue
+                            
+                            # 백엔드로 키 검증 요청
+                            verification_result = await verify_key_with_backend(access_token, camera_id)
+                            
+                            if verification_result["success"]:
+                                # 백엔드 응답 구조: ApiResponse<KeyVerificationResponseDto>
+                                backend_response = verification_result["data"]
+                                
+                                # ApiResponse에서 data 필드 추출
+                                if backend_response.get("isSuccess") and "data" in backend_response:
+                                    response_data = backend_response["data"]
+                                    
+                                    # KeyVerificationResponseDto 필드 확인
+                                    is_valid = response_data.get("valid", False)  # 'isValid' 대신 'valid' 사용
+                                    can_decrypt = response_data.get("canDecrypt", False)
+                                    
+                                    if is_valid and can_decrypt:
+                                        with verification_lock:
+                                            verified_users[websocket_id] = {
+                                                "is_verified": True,
+                                                "decryption_token": response_data.get("decryptionToken"),
+                                                "camera_id": camera_id
+                                            }
+                                        
+                                        await websocket.send_text(json.dumps({
+                                            "type": "verification_result",
+                                            "success": True,
+                                            "message": "키 검증 성공 - 모자이크가 해제됩니다.",
+                                            "canDecrypt": True,
+                                            "isValid": True,
+                                            "expiresAt": response_data.get("expiresAt"),
+                                            "remainingUses": response_data.get("remainingUses"),
+                                            "decryptionToken": response_data.get("decryptionToken"),
+                                            "verifiedAt": response_data.get("verifiedAt"),
+                                            "blockchainVerified": response_data.get("blockchainVerified")
+                                        }))
+                                    else:
+                                        await websocket.send_text(json.dumps({
+                                            "type": "verification_result",
+                                            "success": False,
+                                            "message": response_data.get("message", f"키 검증 실패 - 권한이 없습니다."),
+                                            "canDecrypt": False,
+                                            "isValid": is_valid
+                                        }))
+                                else:
+                                    # API 응답이 실패인 경우
+                                    error_message = backend_response.get("message", "API 응답 오류")
+                                    await websocket.send_text(json.dumps({
+                                        "type": "verification_result",
+                                        "success": False,
+                                        "message": f"백엔드 API 오류: {error_message}",
+                                        "canDecrypt": False
+                                    }))
+                            else:
+                                await websocket.send_text(json.dumps({
+                                    "type": "verification_result",
+                                    "success": False,
+                                    "message": verification_result["message"],
+                                    "canDecrypt": False
+                                }))
+                        
+                        elif data.get("type") == "disconnect":
+                            # 개별 사용자 연결 해제 요청
+                            await websocket.send_text(json.dumps({
+                                "type": "disconnect_result",
+                                "success": True,
+                                "message": "연결이 해제됩니다."
+                            }))
+                            # WebSocket 연결 종료
+                            await websocket.close()
+                            break
+                    
+                    except json.JSONDecodeError:
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": "잘못된 JSON 형식입니다."
+                        }))
+                
+                elif "bytes" in message:
+                    # 비디오 프레임 처리
+                    data = message["bytes"]
+                    nparr = np.frombuffer(data, np.uint8)
+                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    
+                    # 사용자 검증 상태에 따라 모자이크 적용 여부 결정
+                    with verification_lock:
+                        user_status = verified_users.get(websocket_id, {"is_verified": False})
+                    
+                    if user_status["is_verified"]:
+                        # 검증된 사용자: 원본 영상
+                        processed_frame = frame
+                    else:
+                        # 미검증 사용자: 모자이크 적용
+                        processed_frame = process_frame(frame, mode="face_plate")
+                    
+                    _, jpg = cv2.imencode('.jpg', processed_frame)
+                    
+                    # 녹화 중이면 프레임 저장 (원본 또는 처리된 프레임)
+                    with recording_lock:
+                        if is_recording and video_writer is not None:
+                            video_writer.write(processed_frame)
+                    
+                    await websocket.send_bytes(jpg.tobytes())
+                    
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                print(f"WebSocket message processing error: {e}")
+                break
+                
     except Exception as e:
-        print("WebSocket closed:", e)
+        print("WebSocket connection error:", e)
     finally:
         active_websockets.discard(websocket)
+        # 사용자 상태 정리
+        with verification_lock:
+            if websocket_id in verified_users:
+                del verified_users[websocket_id]
 
 # 녹화 시작 엔드포인트
 @app.post("/start_recording")
@@ -143,17 +300,6 @@ async def start_recording():
             }
         else:
             return {"error": "Failed to start recording"}
-
-# S3 업로드 함수
-def upload_to_s3(file_path, filename):
-    if not USE_S3 or not s3_client:
-        return False, "S3 not configured"
-    
-    try:
-        s3_client.upload_file(file_path, S3_BUCKET_NAME, f"recordings/{filename}")
-        return True, f"https://{S3_BUCKET_NAME}.s3.{S3_REGION}.amazonaws.com/recordings/{filename}"
-    except Exception as e:
-        return False, str(e)
 
 # 녹화 중단 엔드포인트
 @app.post("/stop_recording")
@@ -269,14 +415,65 @@ async def recording_status():
         "s3_configured": USE_S3
     }
 
-# HTTP 엔드포인트로 모든 WebSocket 연결 해제
+# HTTP 엔드포인트로 모든 WebSocket 연결 해제 (관리자용)
 @app.post("/disconnect_ws")
 async def disconnect_ws():
+    """
+    모든 WebSocket 연결 해제 (관리자용)
+    """
+    print("모든 WebSocket 연결 해제 실행")
     closed = 0
+    
     for ws in list(active_websockets):
         try:
             await ws.close()
             closed += 1
+            print(f"WebSocket 연결 해제 성공 - ID: {id(ws)}")
         except Exception as e:
             print(f"WebSocket close error: {e}")
-    return {"disconnected": closed}
+    
+    return {
+        "success": True,
+        "message": f"모든 WebSocket 연결이 해제되었습니다.",
+        "disconnected": closed,
+        "total_active_before": len(active_websockets)
+    }
+
+# 현재 연결된 사용자 상태 확인
+@app.get("/verification_status")
+async def get_verification_status():
+    with verification_lock:
+        verified_count = sum(1 for user in verified_users.values() if user["is_verified"])
+        total_count = len(verified_users)
+    
+    return {
+        "total_connections": total_count,
+        "verified_connections": verified_count,
+        "unverified_connections": total_count - verified_count
+    }
+
+# 모든 사용자 모자이크 강제 적용 (긴급상황용)
+@app.post("/force_mosaic")
+async def force_mosaic_all():
+    with verification_lock:
+        for websocket_id in verified_users:
+            verified_users[websocket_id]["is_verified"] = False
+            verified_users[websocket_id]["decryption_token"] = None
+    
+    # 연결된 모든 WebSocket에 모자이크 강제 적용 알림
+    disconnected = 0
+    for ws in list(active_websockets):
+        try:
+            await ws.send_text(json.dumps({
+                "type": "force_mosaic",
+                "message": "모든 연결에 모자이크가 강제 적용되었습니다."
+            }))
+        except Exception as e:
+            print(f"WebSocket send error: {e}")
+            disconnected += 1
+    
+    return {
+        "message": "모든 사용자에게 모자이크가 강제 적용되었습니다.",
+        "affected_connections": len(verified_users),
+        "disconnected": disconnected
+    }
