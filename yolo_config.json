@@ -1,0 +1,7 @@
+{
+  "yolo_model": "yolov8n.pt",
+  "device": null,
+  "conf": 0.35,
+  "iou": 0.45,
+  "sample_rate": 1
+}

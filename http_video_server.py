@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
@@ -8,6 +8,7 @@ from AI_processor import process_frame
 import io
 import os
 from datetime import datetime
+import time
 import threading
 import boto3
 from botocore.exceptions import ClientError
@@ -16,6 +17,13 @@ from dotenv import load_dotenv
 import json
 import aiohttp
 import asyncio
+from typing import Dict, Any
+
+# Optional: lightweight person detector via AnalyticsEngine
+try:
+    from analytics import AnalyticsEngine
+except Exception:
+    AnalyticsEngine = None  # type: ignore
 
 # .env 파일 로드
 load_dotenv()
@@ -34,6 +42,11 @@ app.add_middleware(
 # 연결된 WebSocket 추적용
 active_websockets = set()
 
+# 스트림별 감지/자동녹화 카운터
+stream_stats: Dict[int, Dict[str, Any]] = {}
+# 마지막 종료된 스트림의 스냅샷(감지 횟수 등)
+last_stream_snapshot: Dict[str, Any] | None = None
+
 # 키 검증 관련 설정
 BACKEND_API_URL = os.getenv("BACKEND_API_URL", "http://localhost:8080")  # 백엔드 API URL
 AI_API_KEY = os.getenv("AI_API_KEY")  # AI API 키
@@ -48,6 +61,108 @@ video_writer = None
 recording_filename = None
 recording_lock = threading.Lock()
 TEMP_DIR = tempfile.gettempdir()
+
+# 현재 녹화 세션 상태(자동 녹화용)
+_recording_started_at_ts: float | None = None
+_recording_max_persons: int = 0
+_recording_ws_id: int | None = None
+
+# Auto recording settings
+AUTO_RECORD_ENABLED = True
+AUTO_RECORD_THRESHOLD = 1  # start when >= this many persons detected (user request)
+AUTO_ZERO_TIMEOUT_SEC = 3.0  # stop if no person for this duration
+AUTO_RECORD_DEBUG = True
+
+# Debug state for auto recording
+_auto_debug = {
+    "enabled": AUTO_RECORD_ENABLED,
+    "threshold": AUTO_RECORD_THRESHOLD,
+    "last_check_at": None,
+    "last_person_count": None,
+    "engine_available": False,
+    "hog_available": False,
+    "attempted_start": False,
+    "started": False,
+    "last_error": None,
+}
+
+# Last time we saw at least 1 person (epoch seconds)
+_last_nonzero_person_ts: float | None = None
+# First time we detected zero persons after being non-zero (epoch seconds)
+_zero_since_ts: float | None = None
+
+# Shared analytics engine for auto-record person counting
+AUTO_ENGINE = None
+if AnalyticsEngine is not None:
+    try:
+        _yolo_cfg = {
+            "yolo_model": "yolov8n.pt",
+            "device": None,
+            "conf": 0.35,
+            "iou": 0.45,
+            "sample_rate": 1,
+        }
+        try:
+            cfg_path = os.path.join(os.getcwd(), "yolo_config.json")
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    import json as _json
+                    user_cfg = _json.load(f)
+                    if isinstance(user_cfg, dict):
+                        _yolo_cfg.update(user_cfg)
+        except Exception as _ce:
+            print(f"YOLO config load warning: {_ce}")
+
+        AUTO_ENGINE = AnalyticsEngine(
+            yolo_model=_yolo_cfg.get("yolo_model", "yolov8n.pt"),
+            device=_yolo_cfg.get("device"),
+            conf=float(_yolo_cfg.get("conf", 0.35)),
+            iou=float(_yolo_cfg.get("iou", 0.45)),
+            sample_rate=int(_yolo_cfg.get("sample_rate", 1))
+        )
+        if AUTO_RECORD_DEBUG:
+            print("[AUTO] AnalyticsEngine initialized for person counting")
+    except Exception as _e:
+        print(f"Auto-record AnalyticsEngine init failed: {_e}")
+
+# Fallback HOG person detector (if YOLO unavailable)
+_HOG = None
+try:
+    _HOG = cv2.HOGDescriptor()
+    _HOG.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+    _auto_debug["hog_available"] = True
+except Exception as _he:
+    _HOG = None
+    if AUTO_RECORD_DEBUG:
+        print(f"[AUTO] HOG init failed: {_he}")
+
+
+def _estimate_person_count(frame: np.ndarray) -> int:
+    """Estimate number of persons using YOLO if available, else HOG. Safe and fast-ish."""
+    count = 0
+    try:
+        if 'AUTO_ENGINE' in globals() and AUTO_ENGINE is not None and getattr(AUTO_ENGINE, 'yolo', None) is not None:
+            persons = AUTO_ENGINE._detect_persons(frame) or []
+            count = len(persons) if isinstance(persons, list) else 0
+            _auto_debug["engine_available"] = True
+            return count
+    except Exception as e:
+        _auto_debug["last_error"] = f"YOLO detect error: {e}"
+    # fallback HOG (downscale for speed)
+    try:
+        if _HOG is not None:
+            h, w = frame.shape[:2]
+            scale = 640.0 / max(w, h)
+            if scale < 1.0:
+                small = cv2.resize(frame, (int(w*scale), int(h*scale)))
+            else:
+                small = frame
+            rects, _ = _HOG.detectMultiScale(small, winStride=(8, 8), padding=(8, 8), scale=1.05)
+            count = len(rects) if rects is not None else 0
+            return count
+    except Exception as e:
+        _auto_debug["last_error"] = f"HOG detect error: {e}"
+    return 0
 
 # S3 설정 (환경변수로 설정 권장)
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
@@ -86,6 +201,97 @@ def upload_to_s3(file_path, filename):
     except Exception as e:
         return False, str(e)
 
+
+async def _auto_start_recording_from_frame(frame: np.ndarray, init_person_count: int, ws_id: int) -> None:
+    """Start recording using the current frame size if auto-record is enabled and not already recording."""
+    global is_recording, video_writer, recording_filename, _recording_started_at_ts, _recording_max_persons, _recording_ws_id
+    if not AUTO_RECORD_ENABLED:
+        return
+    h, w = frame.shape[:2]
+    fps = 30.0
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    with recording_lock:
+        if is_recording:
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        recording_filename = f"auto_recording_{timestamp}.mp4"
+        filepath = os.path.join(TEMP_DIR, recording_filename)
+        vw = cv2.VideoWriter(filepath, fourcc, fps, (w, h))
+        if vw.isOpened():
+            video_writer = vw
+            is_recording = True
+            _recording_started_at_ts = time.time()
+            _recording_max_persons = max(0, int(init_person_count))
+            _recording_ws_id = ws_id
+            print(f"Auto recording started: {recording_filename} ({w}x{h}@{fps}), storage={'S3' if USE_S3 else 'local'}")
+        else:
+            # try fallback codec
+            try:
+                fallback_fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+                vw2 = cv2.VideoWriter(filepath, fallback_fourcc, fps, (w, h))
+                if vw2.isOpened():
+                    video_writer = vw2
+                    is_recording = True
+                    _recording_started_at_ts = time.time()
+                    _recording_max_persons = max(0, int(init_person_count))
+                    _recording_ws_id = ws_id
+                    print(f"Auto recording started with MJPG: {recording_filename} ({w}x{h}@{fps})")
+                else:
+                    print("Failed to start auto recording (VideoWriter not opened)")
+            except Exception as e:
+                print(f"Auto recording writer error: {e}")
+
+
+async def _stop_and_finalize_recording():
+    """Stop current recording and upload/move if needed. Returns dict result."""
+    global is_recording, video_writer, recording_filename
+    with recording_lock:
+        if not is_recording:
+            return {"error": "Not recording"}
+        is_recording = False
+        if video_writer is not None:
+            try:
+                video_writer.release()
+            except Exception:
+                pass
+            video_writer = None
+
+        if not recording_filename:
+            return {"status": "Recording stopped", "filename": None}
+
+        temp_filepath = os.path.join(TEMP_DIR, recording_filename)
+        if not os.path.exists(temp_filepath):
+            print(f"Recording stop requested but file missing: {temp_filepath}")
+            return {"error": "Recording file not found"}
+
+        # If S3 configured, upload then delete local
+        if USE_S3 and s3_client:
+            success, result = upload_to_s3(temp_filepath, recording_filename)
+            try:
+                os.remove(temp_filepath)
+            except Exception:
+                pass
+            if success:
+                print(f"Recording finalized - uploaded to S3: {recording_filename} -> {result}")
+                return {
+                    "status": "Recording stopped and uploaded to S3",
+                    "filename": recording_filename,
+                    "s3_url": result,
+                    "storage": "S3",
+                    "error": "no error",
+                }
+            else:
+                print(f"Recording finalized - S3 upload failed: {recording_filename}, error: {result}")
+                return {
+                    "status": "Recording stopped but S3 upload failed",
+                    "filename": recording_filename,
+                    "error": result,
+                    "storage": "S3 (실패)",
+                }
+        # Else keep local file
+        print(f"Recording finalized - kept locally: {temp_filepath}")
+        return {"status": "Recording stopped", "filename": recording_filename, "storage": "local"}
+
 # 키 검증 함수
 async def verify_key_with_backend(access_token: str, camera_id: str):
     """백엔드 API로 키 검증 요청"""
@@ -117,10 +323,19 @@ async def verify_key_with_backend(access_token: str, camera_id: str):
 # 통합 비디오 WebSocket 엔드포인트
 @app.websocket("/ws/video")
 async def unified_video_ws(websocket: WebSocket):
-    global is_recording, video_writer, recording_filename
+    global is_recording, video_writer, recording_filename, _last_nonzero_person_ts, _zero_since_ts, last_stream_snapshot
+    global _recording_started_at_ts, _recording_max_persons, _recording_ws_id
     await websocket.accept()
     websocket_id = id(websocket)
     active_websockets.add(websocket)
+    # 통계 초기화
+    stream_stats[websocket_id] = {
+        "detections": 0,            # 0 -> >=1 전환 횟수
+        "auto_starts": 0,           # 자동 녹화 시작 횟수
+        "prev_person_count": 0,
+        "active": True,
+        "last_updated": datetime.now().isoformat(timespec='seconds')
+    }
     
     # 초기 상태: 모자이크 적용 (미검증 상태)
     with verification_lock:
@@ -214,10 +429,14 @@ async def unified_video_ws(websocket: WebSocket):
                         
                         elif data.get("type") == "disconnect":
                             # 개별 사용자 연결 해제 요청
+                            # 종료 직전 최종 통계 포함 반환
+                            st = stream_stats.get(websocket_id, {})
                             await websocket.send_text(json.dumps({
                                 "type": "disconnect_result",
                                 "success": True,
-                                "message": "연결이 해제됩니다."
+                                "message": "Connection will be closed.",
+                                "detections": int(st.get("detections", 0)),
+                                "auto_starts": int(st.get("auto_starts", 0))
                             }))
                             # WebSocket 연결 종료
                             await websocket.close()
@@ -234,6 +453,113 @@ async def unified_video_ws(websocket: WebSocket):
                     data = message["bytes"]
                     nparr = np.frombuffer(data, np.uint8)
                     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    if frame is None:
+                        if AUTO_RECORD_DEBUG:
+                            print("[AUTO] Received bytes but failed to decode frame")
+                        continue
+
+                    # 자동 녹화: 인원 수 기준으로 시작
+                    try:
+                        # Estimate current person count
+                        pcnt = _estimate_person_count(frame)
+                        if AUTO_RECORD_DEBUG:
+                            _auto_debug.update({
+                                "enabled": AUTO_RECORD_ENABLED,
+                                "threshold": AUTO_RECORD_THRESHOLD,
+                                "last_check_at": datetime.now().isoformat(timespec='seconds'),
+                                "last_person_count": pcnt,
+                                "attempted_start": False,
+                                "started": is_recording,
+                            })
+                        now_ts = time.time()
+                        # 감지 Episode: 0 -> >=1 전환 시 카운트 증가
+                        try:
+                            st = stream_stats.get(websocket_id)
+                            if st is not None:
+                                prev = int(st.get("prev_person_count", 0))
+                                if prev == 0 and pcnt >= 1:
+                                    st["detections"] = int(st.get("detections", 0)) + 1
+                                st["prev_person_count"] = pcnt
+                                st["last_updated"] = datetime.now().isoformat(timespec='seconds')
+                        except Exception:
+                            pass
+                        # auto-start when persons >= threshold
+                        if pcnt >= AUTO_RECORD_THRESHOLD and not is_recording and AUTO_RECORD_ENABLED:
+                            _auto_debug["attempted_start"] = True
+                            await _auto_start_recording_from_frame(frame, pcnt, websocket_id)
+                            _auto_debug["started"] = is_recording
+                            # 자동 녹화 시작 카운트 증가
+                            try:
+                                st = stream_stats.get(websocket_id)
+                                if st is not None:
+                                    st["auto_starts"] = int(st.get("auto_starts", 0)) + 1
+                                    st["last_updated"] = datetime.now().isoformat(timespec='seconds')
+                            except Exception:
+                                pass
+                            # 시작 알림(WebSocket 푸시)
+                            if is_recording:
+                                try:
+                                    started_iso = None
+                                    if _recording_started_at_ts is not None:
+                                        started_iso = datetime.fromtimestamp(_recording_started_at_ts).isoformat(timespec='seconds')
+                                    payload_start = {
+                                        "type": "auto_recording_started",
+                                        "filename": recording_filename,
+                                        "started_at": started_iso,
+                                        "initial_persons": int(pcnt),
+                                        "storage": "S3" if USE_S3 else "local",
+                                    }
+                                    await websocket.send_text(json.dumps(payload_start))
+                                except Exception as _se2:
+                                    print(f"WS start notify error: {_se2}")
+                        # 녹화 중 최대 인원수 갱신
+                        if is_recording:
+                            try:
+                                global _recording_max_persons
+                                _recording_max_persons = max(_recording_max_persons, int(pcnt))
+                            except Exception:
+                                pass
+                        # update zero/nonzero timers with hysteresis
+                        if pcnt >= 1:
+                            _last_nonzero_person_ts = now_ts
+                            _zero_since_ts = None
+                            _auto_debug.pop("zero_gap_sec", None)
+                        else:
+                            if _zero_since_ts is None:
+                                _zero_since_ts = now_ts
+                            zero_gap = now_ts - _zero_since_ts
+                            _auto_debug["zero_gap_sec"] = round(zero_gap, 2)
+                            # auto-stop when zero sustained beyond timeout
+                            if is_recording and zero_gap >= AUTO_ZERO_TIMEOUT_SEC:
+                                res = await _stop_and_finalize_recording()
+                                if AUTO_RECORD_DEBUG:
+                                    print(f"Auto stop after {zero_gap:.1f}s with zero persons -> {res}")
+                                # 자동 녹화 종료 알림(WebSocket 푸시)
+                                try:
+                                    duration = None
+                                    if _recording_started_at_ts is not None:
+                                        duration = round(time.time() - _recording_started_at_ts, 2)
+                                    payload = {
+                                        "type": "auto_recording_finalized",
+                                        "filename": recording_filename,
+                                        "segment_max_persons": int(_recording_max_persons),
+                                        "duration_sec": duration,
+                                        "storage": res.get("storage"),
+                                    }
+                                    if res.get("s3_url"):
+                                        payload["s3_url"] = res["s3_url"]
+                                    await websocket.send_text(json.dumps(payload))
+                                except Exception as _se:
+                                    print(f"WS notify error: {_se}")
+                                finally:
+                                    # 세션 상태 리셋
+                                    _recording_max_persons = 0
+                                    _recording_ws_id = None
+                                    _recording_started_at_ts = None
+                    except Exception as e:
+                        # Do not break stream on detection errors
+                        print(f"Auto record check error: {e}")
+                        _auto_debug["last_error"] = f"check error: {e}"
                     
                     # 사용자 검증 상태에 따라 모자이크 적용 여부 결정
                     with verification_lock:
@@ -269,6 +595,88 @@ async def unified_video_ws(websocket: WebSocket):
         with verification_lock:
             if websocket_id in verified_users:
                 del verified_users[websocket_id]
+        # 스트림 상태 비활성 처리
+        try:
+            if websocket_id in stream_stats:
+                stream_stats[websocket_id]["active"] = False
+                stream_stats[websocket_id]["last_updated"] = datetime.now().isoformat(timespec='seconds')
+                # 종료 스냅샷 업데이트
+                st = stream_stats.get(websocket_id, {})
+                last_stream_snapshot = {
+                    "stream_id": str(websocket_id),
+                    "detections": int(st.get("detections", 0)),
+                    "auto_starts": int(st.get("auto_starts", 0)),
+                    "ended_at": datetime.now().isoformat(timespec='seconds')
+                }
+        except Exception:
+            pass
+
+ 
+
+# 마지막 종료된 스트림의 감지 횟수 조회
+@app.get("/last_detections")
+async def get_last_detections():
+    if last_stream_snapshot is None:
+        return {"available": False, "message": "아직 종료된 스트림이 없습니다."}
+    return {
+        "available": True,
+        "stream_id": last_stream_snapshot.get("stream_id"),
+        "detections": last_stream_snapshot.get("detections", 0),
+        "auto_starts": last_stream_snapshot.get("auto_starts", 0),
+        "ended_at": last_stream_snapshot.get("ended_at")
+    }
+
+# Auto-recording debug endpoint
+@app.get("/auto_recording/debug")
+async def auto_recording_debug():
+    state = dict(_auto_debug)
+    state.update({
+        "is_recording": is_recording,
+        "last_nonzero_person_ts": _last_nonzero_person_ts,
+    "zero_since_ts": _zero_since_ts,
+        "zero_timeout_sec": AUTO_ZERO_TIMEOUT_SEC,
+    })
+    # compute seconds since last_nonzero if available
+    try:
+        if _last_nonzero_person_ts is not None:
+            state["seconds_since_last_nonzero"] = round(time.time() - _last_nonzero_person_ts, 2)
+    except Exception:
+        pass
+    return state
+
+# ---- Auto-recording settings API ----
+@app.get("/auto_recording")
+async def get_auto_recording():
+    return {
+        "enabled": AUTO_RECORD_ENABLED,
+        "threshold": AUTO_RECORD_THRESHOLD,
+        "is_recording": is_recording,
+        "s3_configured": USE_S3
+    }
+
+
+@app.post("/auto_recording")
+async def set_auto_recording(payload: Dict[str, Any] = Body(default={})):  # expects {"enabled": bool, "threshold": int}
+    global AUTO_RECORD_ENABLED, AUTO_RECORD_THRESHOLD
+    if not isinstance(payload, dict):
+        return {"error": "Invalid body"}
+    if "enabled" in payload:
+        try:
+            AUTO_RECORD_ENABLED = bool(payload["enabled"])
+        except Exception:
+            return {"error": "'enabled' must be boolean"}
+    if "threshold" in payload:
+        try:
+            th = int(payload["threshold"])
+            if th < 1:
+                return {"error": "'threshold' must be >= 1"}
+            AUTO_RECORD_THRESHOLD = th
+        except Exception:
+            return {"error": "'threshold' must be integer"}
+    return {
+        "enabled": AUTO_RECORD_ENABLED,
+        "threshold": AUTO_RECORD_THRESHOLD
+    }
 
 # 녹화 시작 엔드포인트
 @app.post("/start_recording")
@@ -304,50 +712,8 @@ async def start_recording():
 # 녹화 중단 엔드포인트
 @app.post("/stop_recording")
 async def stop_recording():
-    global is_recording, video_writer, recording_filename
-    
-    if not USE_S3 or not s3_client:
-        return {"error": "S3 연결 오류: 환경변수를 확인하세요"}
-    
-    with recording_lock:
-        if not is_recording:
-            return {"error": "Not recording"}
-        
-        is_recording = False
-        if video_writer is not None:
-            video_writer.release()
-            video_writer = None
-        
-        if recording_filename:
-            temp_filepath = os.path.join(TEMP_DIR, recording_filename)
-            if os.path.exists(temp_filepath):
-                success, result = upload_to_s3(temp_filepath, recording_filename)
-                
-                # 임시 파일 삭제
-                try:
-                    os.remove(temp_filepath)
-                except Exception as e:
-                    print(f"임시 파일 삭제 실패: {e}")
-                
-                if success:
-                    return {
-                        "status": "Recording stopped and uploaded to S3", 
-                        "filename": recording_filename,
-                        "s3_url": result,
-                        "storage": "S3",
-                        "error" : "no error"
-                    }
-                else:
-                    return {
-                        "status": "Recording stopped but S3 upload failed", 
-                        "filename": recording_filename,
-                        "error": result,
-                        "storage": "S3 (실패)"
-                    }
-            else:
-                return {"error": "Recording file not found"}
-        
-        return {"status": "Recording stopped", "filename": recording_filename}
+    # Reuse common stop logic (handles S3 present/absent)
+    return await _stop_and_finalize_recording()
 
 # S3에서 녹화 파일 목록 조회
 @app.get("/recordings")
@@ -426,6 +792,18 @@ async def disconnect_ws():
     
     for ws in list(active_websockets):
         try:
+            # 종료 전 최종 통계 전송
+            ws_id = id(ws)
+            st = stream_stats.get(ws_id, {})
+            try:
+                await ws.send_text(json.dumps({
+                    "type": "final_stats",
+                    "detections": int(st.get("detections", 0)),
+                    "auto_starts": int(st.get("auto_starts", 0)),
+                    "message": "Connection will be closed by server."
+                }))
+            except Exception:
+                pass
             await ws.close()
             closed += 1
             print(f"WebSocket 연결 해제 성공 - ID: {id(ws)}")
