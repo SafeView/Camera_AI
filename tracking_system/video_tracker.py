@@ -155,92 +155,99 @@ class VideoTracker:
     def _main_loop(self):
         """메인 루프"""
         while True:
-            loop_start = time.time()
-            
-            if self.is_playing:
-                ret, frame = self.cap.read()
-                if not ret:
-                    # 영상 끝에 도달하면 처음으로 되돌리기
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    self.current_frame_number = 0
-                    continue
+            try:
+                loop_start = time.time()
                 
-                # 프레임 크기 조절 (성능 향상)
-                if self.resize_enabled:
-                    frame = cv2.resize(frame, (self.target_width, self.target_height))
-                
-                self.current_frame = frame.copy()
-                self.current_frame_number = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-            else:
-                # 일시정지 상태에서는 현재 프레임 유지
-                if self.current_frame is None:
+                if self.is_playing:
                     ret, frame = self.cap.read()
-                    if ret:
-                        if self.resize_enabled:
-                            frame = cv2.resize(frame, (self.target_width, self.target_height))
-                        self.current_frame = frame.copy()
-                    else:
-                        break
-                frame = self.current_frame.copy()
-            
-            # 프레임 스킵 처리
-            self.frame_counter += 1
-            if self.frame_counter % self.skip_frames != 0:
-                # 스킵된 프레임은 이전 추적 결과 사용
-                if hasattr(self, 'last_tracking_result'):
-                    tracking_result = self.last_tracking_result
-                else:
-                    tracking_result = self.tracker.update_tracking(frame)
-            else:
-                # 검출 비활성화 모드 체크
-                if self.detection_disabled:
-                    # 검출은 하지 않지만 추적은 계속 업데이트
-                    tracking_result = self.tracker.update_tracking(frame)
-                    self.last_tracking_result = tracking_result
-                else:
-                    # 검출 간격 체크
-                    current_time = time.time()
-                    detection_interval = self._get_detection_interval()
+                    if not ret:
+                        # 영상 끝에 도달하면 처음으로 되돌리기
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        self.current_frame_number = 0
+                        continue
                     
-                    if current_time - self.last_detection_time >= detection_interval:
-                        tracking_result = self._get_cached_tracking_result(frame, current_time)
-                        self.last_tracking_result = tracking_result
-                        self.last_detection_time = current_time
-                        
-                        # 추적 시작 상태 업데이트
-                        if self.is_tracking_starting:
-                            if current_time - self.tracking_start_time >= self.tracking_start_interval:
-                                self.is_tracking_starting = False
-                                print("⚡ 추적 성능 최적화 완료")
+                    # 프레임 크기 조절 (성능 향상)
+                    if self.resize_enabled:
+                        frame = cv2.resize(frame, (self.target_width, self.target_height))
+                    
+                    self.current_frame = frame.copy()
+                    self.current_frame_number = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+                else:
+                    # 일시정지 상태에서는 현재 프레임 유지
+                    if self.current_frame is None:
+                        ret, frame = self.cap.read()
+                        if ret:
+                            if self.resize_enabled:
+                                frame = cv2.resize(frame, (self.target_width, self.target_height))
+                            self.current_frame = frame.copy()
+                        else:
+                            break
+                    frame = self.current_frame.copy()
+                
+                # 프레임 스킵 처리
+                self.frame_counter += 1
+                if self.frame_counter % self.skip_frames != 0:
+                    # 스킵된 프레임은 이전 추적 결과 사용
+                    if hasattr(self, 'last_tracking_result'):
+                        tracking_result = self.last_tracking_result
                     else:
-                        # 검출 간격 내에서는 이전 결과 사용
-                        tracking_result = self.last_tracking_result if hasattr(self, 'last_tracking_result') else self.tracker.update_tracking(frame)
-            
-            # 엄격한 타겟 모드 필터링 적용
-            tracking_result = self._filter_tracking_result(tracking_result)
-            
-            # 프레임 처리 및 표시
-            processed_frame = self._process_frame(frame, tracking_result)
-            cv2.imshow(self.window_name, processed_frame)
-            
-            # 키 입력 처리
-            if self._handle_key_input():
+                        tracking_result = self.tracker.update_tracking(frame)
+                else:
+                    # 검출 비활성화 모드 체크
+                    if self.detection_disabled:
+                        # 검출은 하지 않지만 추적은 계속 업데이트
+                        tracking_result = self.tracker.update_tracking(frame)
+                        self.last_tracking_result = tracking_result
+                    else:
+                        # 검출 간격 체크
+                        current_time = time.time()
+                        detection_interval = self._get_detection_interval()
+                        
+                        if current_time - self.last_detection_time >= detection_interval:
+                            tracking_result = self._get_cached_tracking_result(frame, current_time)
+                            self.last_tracking_result = tracking_result
+                            self.last_detection_time = current_time
+                            
+                            # 추적 시작 상태 업데이트
+                            if self.is_tracking_starting:
+                                if current_time - self.tracking_start_time >= self.tracking_start_interval:
+                                    self.is_tracking_starting = False
+                                    print("⚡ 추적 성능 최적화 완료")
+                        else:
+                            # 검출 간격 내에서는 이전 결과 사용
+                            tracking_result = self.last_tracking_result if hasattr(self, 'last_tracking_result') else self.tracker.update_tracking(frame)
+                
+                # 엄격한 타겟 모드 필터링 적용
+                tracking_result = self._filter_tracking_result(tracking_result)
+                
+                # 프레임 처리 및 표시
+                processed_frame = self._process_frame(frame, tracking_result)
+                cv2.imshow(self.window_name, processed_frame)
+                
+                # 키 입력 처리
+                if self._handle_key_input():
+                    break
+                
+                # 성능 모니터링
+                frame_time = time.time() - loop_start
+                self.frame_times.append(frame_time)
+                if len(self.frame_times) > 30:
+                    self.frame_times.pop(0)
+                
+                # 평균 FPS 계산
+                if len(self.frame_times) > 0:
+                    avg_frame_time = sum(self.frame_times) / len(self.frame_times)
+                    self.avg_fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
+                
+                # 프레임 속도 조절 - 더 빠르게
+                target_delay = max(1, int(1000 / min(60, self.fps * 2)))  # 더 빠른 재생
+                cv2.waitKey(target_delay)
+                
+            except Exception as e:
+                print(f"❌ 메인 루프 오류: {e}")
+                import traceback
+                traceback.print_exc()
                 break
-            
-            # 성능 모니터링
-            frame_time = time.time() - loop_start
-            self.frame_times.append(frame_time)
-            if len(self.frame_times) > 30:
-                self.frame_times.pop(0)
-            
-            # 평균 FPS 계산
-            if len(self.frame_times) > 0:
-                avg_frame_time = sum(self.frame_times) / len(self.frame_times)
-                self.avg_fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
-            
-            # 프레임 속도 조절 - 더 빠르게
-            target_delay = max(1, int(1000 / min(60, self.fps * 2)))  # 더 빠른 재생
-            cv2.waitKey(target_delay)
     
     def _get_detection_interval(self) -> float:
         """현재 상황에 따른 검출 간격 반환"""

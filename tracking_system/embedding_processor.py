@@ -216,7 +216,7 @@ class EnsembleEmbedder:
         for embedder in self.embedders:
             try:
                 embedding = embedder.compute_embedding(face_roi)
-                if embedding is not None:
+                if embedding is not None and embedding.ndim == 1:
                     embeddings.append(embedding)
             except Exception as e:
                 print(f"앙상블 임베딩 오류: {e}")
@@ -224,15 +224,28 @@ class EnsembleEmbedder:
         if not embeddings:
             return None
         
-        # 앙상블 평균 계산
-        ensemble_embedding = np.mean(embeddings, axis=0)
+        # 모든 임베딩이 같은 차원인지 확인
+        embedding_shapes = [emb.shape for emb in embeddings]
+        if len(set(embedding_shapes)) > 1:
+            print(f"⚠️ 서로 다른 차원의 임베딩들: {embedding_shapes}")
+            # 첫 번째 임베딩만 사용
+            return embeddings[0].astype(np.float32)
         
-        # 정규화
-        norm = np.linalg.norm(ensemble_embedding)
-        if norm > 0:
-            ensemble_embedding = ensemble_embedding / norm
-        
-        return ensemble_embedding.astype(np.float32)
+        try:
+            # 앙상블 평균 계산
+            embeddings_array = np.array(embeddings)
+            ensemble_embedding = np.mean(embeddings_array, axis=0)
+            
+            # 정규화
+            norm = np.linalg.norm(ensemble_embedding)
+            if norm > 0:
+                ensemble_embedding = ensemble_embedding / norm
+            
+            return ensemble_embedding.astype(np.float32)
+        except Exception as e:
+            print(f"❌ 앙상블 평균 계산 오류: {e}")
+            # 첫 번째 임베딩만 사용
+            return embeddings[0].astype(np.float32)
 
 class EnhancedEmbeddingProcessor:
     """개선된 임베딩 처리기"""
@@ -388,16 +401,45 @@ class EnhancedEmbeddingProcessor:
             if not features:
                 return None
             
-            # 특징 결합
-            combined_features = np.concatenate(features)
-            
-            # 정규화
-            normalized_features = self._normalize_embedding(combined_features)
+            # 특징 결합 (안전한 버전)
+            try:
+                # 모든 특징이 1차원 배열인지 확인
+                valid_features = []
+                for i, feature in enumerate(features):
+                    if feature is not None and feature.ndim == 1:
+                        valid_features.append(feature)
+                        print(f"✅ 특징 {i} 추가: {feature.shape}")
+                    else:
+                        print(f"⚠️ 유효하지 않은 특징 {i} 차원: {feature.shape if feature is not None else 'None'}")
+                
+                if not valid_features:
+                    print("❌ 유효한 특징이 없음")
+                    return None
+                
+                print(f"🔍 결합할 특징 수: {len(valid_features)}")
+                combined_features = np.concatenate(valid_features)
+                print(f"✅ 특징 결합 성공: {combined_features.shape}")
+                
+                # 정규화
+                normalized_features = self._normalize_embedding(combined_features)
+                print(f"✅ 정규화 성공: {normalized_features.shape}")
+                
+            except Exception as e:
+                print(f"❌ 특징 결합 오류: {e}")
+                import traceback
+                traceback.print_exc()
+                # 폴백: 첫 번째 유효한 특징만 사용
+                for feature in features:
+                    if feature is not None and feature.ndim == 1:
+                        return self._normalize_embedding(feature)
+                return None
             
             return normalized_features
             
         except Exception as e:
             print(f"사람 임베딩 계산 오류: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def _compute_color_histogram(self, roi: np.ndarray) -> Optional[np.ndarray]:
