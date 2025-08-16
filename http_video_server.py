@@ -1664,23 +1664,206 @@ async def upload_video(file: UploadFile = File(...)):
 
 @app.post("/face-detection/detect-faces")
 async def detect_faces(
-    filename: str = Query(..., description="업로드된 비디오 파일명"),
-    time_input: str = Query(..., description="시작 시간 (예: '1 30' = 1분 30초부터, '90' = 90초부터)")
+    filename: str = Query(None, description="비디오 파일명 (로컬 또는 S3)"),
+    time_input: str = Query(..., description="시작 시간 (예: '1 30' = 1분 30초부터, '90' = 90초부터)"),
+    from_s3: bool = Query(False, description="S3에서 파일을 가져올지 여부"),
+    video_url: str = Query(None, description="동영상 URL (filename 대신 사용)")
 ):
     """특정 시간부터 얼굴 검출"""
     try:
-        file_path = os.path.join(upload_dir, filename)
-        if not os.path.exists(file_path):
-            raise HTTPException(
-                status_code=404, 
-                detail="업로드된 비디오 파일을 찾을 수 없습니다"
-            )
+        file_path = None
+        
+        if video_url:
+            # URL에서 동영상 스트리밍 처리
+            try:
+                import requests
+                import cv2
+                import numpy as np
+                
+                print(f"URL에서 동영상 스트리밍 시작: {video_url}")
+                
+                # OpenCV로 직접 URL 스트리밍
+                cap = cv2.VideoCapture(video_url)
+                if not cap.isOpened():
+                    raise Exception("동영상 URL을 열 수 없습니다")
+                
+                # 동영상 정보 가져오기
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                duration = total_frames / fps if fps > 0 else 0
+                
+                # 시작 프레임 계산
+                start_time_seconds = start_minutes * 60 + start_seconds
+                start_frame = int(start_time_seconds * fps)
+                
+                # 입력 시간 검증
+                if start_time_seconds > duration:
+                    cap.release()
+                    return JSONResponse(content={
+                        "error": f"입력한 시간({start_minutes}분 {start_seconds}초)이 동영상 길이({duration:.1f}초)를 초과합니다.",
+                        "video_info": {
+                            "duration": duration,
+                            "total_frames": total_frames,
+                            "fps": fps
+                        }
+                    }, status_code=400)
+                
+                # 결과 저장 디렉토리 생성
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                result_id = f"time_detection_{timestamp}"
+                result_dir = os.path.join(api_results_dir, result_id)
+                faces_dir = os.path.join(result_dir, "faces")
+                os.makedirs(faces_dir, exist_ok=True)
+                
+                # 얼굴 검출 결과
+                detected_faces = []
+                unique_faces_count = 0
+                total_faces_detected = 0
+                
+                # 얼굴 해시 및 바운딩 박스 초기화
+                face_hashes = []
+                face_bboxes = []
+                
+                # 시작 프레임으로 이동
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                
+                frame_count = start_frame
+                detector = initialize_face_detector()
+                
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    # 1초마다 프레임 처리 (성능 최적화)
+                    if frame_count % int(fps) == 0:
+                        # 얼굴 검출 (YOLOv8)
+                        if hasattr(detector, 'predict'):
+                            results = detector(frame, verbose=False)
+                            
+                            for result in results:
+                                boxes = result.boxes
+                                if boxes is not None:
+                                    for box in boxes:
+                                        # 신뢰도 확인
+                                        confidence = float(box.conf[0])
+                                        if confidence < FACE_DETECTION_CONFIDENCE_THRESHOLD:
+                                            continue
+                                        
+                                        # 바운딩 박스 좌표
+                                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                                        
+                                        # 얼굴 영역 추출
+                                        face_image = frame[y1:y2, x1:x2]
+                                        if face_image.size == 0:
+                                            continue
+                                        
+                                        # 얼굴 해시 계산
+                                        face_hash = calculate_image_hash(face_image)
+                                        if face_hash is None:
+                                            continue
+                                        
+                                        total_faces_detected += 1
+                                        
+                                        # 중복 검사
+                                        bbox_coords = [int(x1), int(y1), int(x2), int(y2)]
+                                        if not is_duplicate_face(face_hash, bbox_coords):
+                                            # 새로운 얼굴이면 저장
+                                            face_hashes.append(face_hash)
+                                            face_bboxes.append(bbox_coords)
+                                            unique_faces_count += 1
+                                            
+                                            # 얼굴 이미지 저장
+                                            face_filename = f"face_{unique_faces_count:03d}_{timestamp}.jpg"
+                                            face_path = os.path.join(faces_dir, face_filename)
+                                            cv2.imwrite(face_path, face_image)
+                                            
+                                            # S3 업로드
+                                            s3_key = f"api_results/{result_id}/faces/{face_filename}"
+                                            s3_url = upload_face_to_s3(face_path, s3_key)
+                                            
+                                            detected_faces.append({
+                                                "s3_url": s3_url
+                                            })
+                    
+                    frame_count += 1
+                    
+                    # 환경 변수에서 설정한 시간 후 중단 (성능 최적화)
+                    if frame_count - start_frame > int(fps * PROCESSING_DURATION_SECONDS):
+                        break
+                
+                cap.release()
+                
+                # 결과 요약 저장
+                summary = {
+                    "faces": detected_faces
+                }
+                
+                # 결과 JSON 저장
+                summary_path = os.path.join(result_dir, "face_records.json")
+                with open(summary_path, 'w', encoding='utf-8') as f:
+                    json.dump(summary, f, ensure_ascii=False, indent=2)
+                
+                return summary
+                
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"URL에서 동영상 처리 실패: {str(e)}"
+                )
+        
+        elif from_s3:
+            # S3에서 파일 다운로드
+            if not USE_S3 or not s3_client:
+                raise HTTPException(
+                    status_code=400,
+                    detail="S3가 설정되지 않았습니다"
+                )
+            
+            try:
+                # S3에서 파일 존재 확인
+                s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=f"recordings/{filename}")
+                
+                # 임시 파일로 다운로드
+                temp_file = os.path.join(tempfile.gettempdir(), f"temp_{filename}")
+                s3_client.download_file(S3_BUCKET_NAME, f"recordings/{filename}", temp_file)
+                file_path = temp_file
+                
+                print(f"S3에서 파일 다운로드 완료: {filename} -> {temp_file}")
+                
+            except Exception as e:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"S3에서 파일을 찾을 수 없습니다: {filename}"
+                )
+        else:
+            # 로컬 파일 사용
+            if not filename:
+                raise HTTPException(
+                    status_code=400,
+                    detail="filename 또는 video_url 중 하나는 필수입니다"
+                )
+            
+            file_path = os.path.join(upload_dir, filename)
+            if not os.path.exists(file_path):
+                raise HTTPException(
+                    status_code=404, 
+                    detail="업로드된 비디오 파일을 찾을 수 없습니다"
+                )
         
         # 시간 입력 파싱
         start_minutes, start_seconds = parse_time_input(time_input)
         
         # 얼굴 검출 실행
         result = detect_faces_at_time(file_path, start_minutes, start_seconds)
+        
+        # 임시 파일 삭제 (S3 또는 URL에서 다운로드한 파일)
+        if (from_s3 or video_url) and file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                print(f"임시 파일 삭제: {file_path}")
+            except Exception as e:
+                print(f"임시 파일 삭제 실패: {e}")
         
         # 오류가 있는 경우
         if "error" in result:
