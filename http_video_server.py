@@ -1671,6 +1671,21 @@ async def detect_faces(
 ):
     """특정 시간부터 얼굴 검출"""
     try:
+        # 시간 입력 파싱
+        try:
+            time_parts = time_input.split()
+            if len(time_parts) == 2:
+                start_minutes = int(time_parts[0])
+                start_seconds = int(time_parts[1])
+            elif len(time_parts) == 1:
+                total_seconds = int(time_parts[0])
+                start_minutes = total_seconds // 60
+                start_seconds = total_seconds % 60
+            else:
+                raise ValueError("잘못된 시간 형식입니다. '1 30' 또는 '90' 형식으로 입력하세요.")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"시간 파싱 오류: {str(e)}")
+        
         file_path = None
         
         if video_url:
