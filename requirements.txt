@@ -8,3 +8,6 @@ requests
 mysql-connector-python
 aiohttp
 websockets
+ultralytics
+scikit-learn
+python-multipart
