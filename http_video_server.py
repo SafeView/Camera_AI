@@ -64,6 +64,9 @@ AI_API_KEY = os.getenv("AI_API_KEY")  # AI API 키
 verified_users = {}  # {websocket_id: {"is_verified": bool, "decryption_token": str, "camera_id": str}}
 verification_lock = threading.Lock()
 
+# 최근 수신된 사용자 정보 저장용 (POST로 전달되는 userId)
+last_user_info: Dict[str, Any] | None = None
+
 # 녹화 관련 변수
 is_recording = False
 video_writer = None  # processed (mosaic) stream writer
@@ -337,6 +340,34 @@ def upload_to_s3(file_path, filename):
         return True, f"https://{S3_BUCKET_NAME}.s3.{S3_REGION}.amazonaws.com/recordings/{filename}"
     except Exception as e:
         return False, str(e)
+
+# Spring 서버 엔드포인트 (자동 녹화 종료 시 사용자 식별자 및 URL 목록 전달)
+SPRING_MAKE_ENTITY_URL = os.getenv("SPRING_MAKE_ENTITY_URL", "http://localhost:8080/api/videos/make-entity")
+
+async def _notify_spring_make_entity(user_id: str, urls: list | None = None) -> None:
+    if not user_id:
+        return
+    payload = {"userId": user_id, "urls": urls or []}
+    try:
+        _prev = payload["urls"][:2]
+        _more = " ..." if len(payload["urls"]) > 2 else ""
+        print(f"[SPRING] POST {SPRING_MAKE_ENTITY_URL} body={{userId:{user_id}, urls:{_prev}{_more}}}")
+    except Exception:
+        pass
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                SPRING_MAKE_ENTITY_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            ) as resp:
+                if 200 <= resp.status < 300:
+                    print(f"[SPRING] make-entity OK for userId={user_id}, urls={len(payload['urls'])}")
+                else:
+                    txt = await resp.text()
+                    print(f"[SPRING] make-entity failed {resp.status}: {txt}")
+    except Exception as e:
+        print(f"[SPRING] make-entity error: {e}")
 
 
 async def _auto_start_recording_from_frame(frame: np.ndarray, init_person_count: int, ws_id: int) -> None:
@@ -689,8 +720,8 @@ async def unified_video_ws(websocket: WebSocket):
                                         started_iso = datetime.fromtimestamp(_recording_started_at_ts).isoformat(timespec='seconds')
                                     payload_start = {
                                         "type": "auto_recording_started",
-                                        "filename": recording_filename,
-                                        "filenames": [fn for fn in [recording_filename, recording_filename_raw] if fn],
+                                        # Only set filename if processed writer is active
+                                        "filename": (recording_filename if (video_writer is not None and recording_filename) else None),
                                         "started_at": started_iso,
                                         "initial_persons": int(pcnt),
                                         "storage": "S3" if USE_S3 else "local",
@@ -709,8 +740,8 @@ async def unified_video_ws(websocket: WebSocket):
                                         started_iso = datetime.fromtimestamp(_recording_started_at_ts).isoformat(timespec='seconds')
                                     payload_start = {
                                         "type": "manual_recording_started",
-                                        "filename": recording_filename,
-                                        "filenames": [fn for fn in [recording_filename, recording_filename_raw] if fn],
+                                        # Only set filename if processed writer is active
+                                        "filename": (recording_filename if (video_writer is not None and recording_filename) else None),
                                         "started_at": started_iso,
                                         "initial_persons": int(pcnt),
                                         "storage": "S3" if USE_S3 else "local",
@@ -751,18 +782,113 @@ async def unified_video_ws(websocket: WebSocket):
                                     duration = None
                                     if _recording_started_at_ts is not None:
                                         duration = round(time.time() - _recording_started_at_ts, 2)
+                                        # Build payload exposing only mosaic (processed) artifacts
+                                        # Spring 서버에 userId와 URL 목록 전송 (비동기, 베스트 에포트)
+                                        try:
+                                            if last_user_info and isinstance(last_user_info, dict):
+                                                uid = last_user_info.get("userId")
+                                                if isinstance(uid, str) and uid:
+                                                    urls_for_spring: list[str] = []
+                                                    # 1) S3에서 처리본/원본 URL 모두 수집 시도
+                                                    try:
+                                                        if isinstance(res.get("s3_urls"), list):
+                                                            if recording_filename:
+                                                                proc_url = next(
+                                                                    (
+                                                                        u for u in res["s3_urls"]
+                                                                        if isinstance(u, str) and u.endswith(f"/{recording_filename}")
+                                                                    ),
+                                                                    None,
+                                                                )
+                                                                if proc_url:
+                                                                    urls_for_spring.append(proc_url)
+                                                            if recording_filename_raw:
+                                                                raw_url = next(
+                                                                    (
+                                                                        u for u in res["s3_urls"]
+                                                                        if isinstance(u, str) and u.endswith(f"/{recording_filename_raw}")
+                                                                    ),
+                                                                    None,
+                                                                )
+                                                                if raw_url:
+                                                                    urls_for_spring.append(raw_url)
+                                                    except Exception:
+                                                        pass
+                                                    # 2) 비어있거나 일부만 있는 경우, 로컬 경로로 보완
+                                                    try:
+                                                        if recording_filename and isinstance(res.get("local_paths"), list):
+                                                            need_proc = not any(isinstance(u, str) and u.endswith(f"/{recording_filename}") for u in urls_for_spring)
+                                                            if need_proc:
+                                                                proc_local = next(
+                                                                    (
+                                                                        p for p in res["local_paths"]
+                                                                        if isinstance(p, str) and p.endswith(f"/{recording_filename}")
+                                                                    ),
+                                                                    None,
+                                                                )
+                                                                if proc_local:
+                                                                    urls_for_spring.append(proc_local)
+                                                        if recording_filename_raw and isinstance(res.get("local_paths"), list):
+                                                            need_raw = not any(isinstance(u, str) and u.endswith(f"/{recording_filename_raw}") for u in urls_for_spring)
+                                                            if need_raw:
+                                                                raw_local = next(
+                                                                    (
+                                                                        p for p in res["local_paths"]
+                                                                        if isinstance(p, str) and p.endswith(f"/{recording_filename_raw}")
+                                                                    ),
+                                                                    None,
+                                                                )
+                                                                if raw_local:
+                                                                    urls_for_spring.append(raw_local)
+                                                    except Exception:
+                                                        pass
+                                                    if urls_for_spring:
+                                                        _prev = urls_for_spring[:2]
+                                                        _more = " ..." if len(urls_for_spring) > 2 else ""
+                                                        print(f"[SPRING] notify enqueue userId={uid}, urls={len(urls_for_spring)}: {_prev}{_more}")
+                                                        asyncio.create_task(_notify_spring_make_entity(uid, urls_for_spring))
+                                                    else:
+                                                        print("[SPRING] skipping notify: no processed URL(s) to send")
+                                                else:
+                                                    print("[SPRING] skipping notify: invalid or missing userId")
+                                            else:
+                                                print("[SPRING] skipping notify: last_user_info not set")
+                                        except Exception as _spr_assemble_err:
+                                            print(f"[SPRING] notify assemble error: {_spr_assemble_err}")
+                                    # Determine if processed file actually exists in results
+                                    try:
+                                        proc_present = False
+                                        if isinstance(res.get("filenames"), list) and recording_filename:
+                                            proc_present = any(fi == recording_filename for fi in res["filenames"])
+                                    except Exception:
+                                        proc_present = False
                                     payload = {
                                         "type": "auto_recording_finalized",
-                                        "filenames": res.get("filenames") or ([recording_filename] if recording_filename else []),
+                                        # Only single processed filename (no array)
+                                        "filename": (recording_filename if proc_present else None),
                                         "segment_max_persons": int(_recording_max_persons),
                                         "duration_sec": duration,
                                         "storage": res.get("storage"),
                                     }
+                                    # If S3, include only the processed URL as a single s3_url (no array)
                                     if res.get("s3_urls"):
-                                        payload["s3_urls"] = res["s3_urls"]
-                                        # backward-compat: also include first url as s3_url
-                                        if len(res["s3_urls"]) > 0:
-                                            payload["s3_url"] = res["s3_urls"][0]
+                                        proc_url = None
+                                        if recording_filename:
+                                            try:
+                                                proc_url = next((u for u in res["s3_urls"] if u.endswith(f"/{recording_filename}")), None)
+                                            except Exception:
+                                                proc_url = None
+                                        if proc_url:
+                                            payload["s3_url"] = proc_url
+                                    # If local, filter local_paths to only processed
+                                    if res.get("local_paths"):
+                                        proc_local = None
+                                        if recording_filename:
+                                            try:
+                                                proc_local = next((p for p in res["local_paths"] if p.endswith(f"/{recording_filename}")), None)
+                                            except Exception:
+                                                proc_local = None
+                                        payload["local_paths"] = [proc_local] if proc_local else []
                                     await websocket.send_text(json.dumps(payload))
                                 except Exception as _se:
                                     print(f"WS notify error: {_se}")
@@ -991,6 +1117,29 @@ async def get_last_detections():
         "detections": last_stream_snapshot.get("detections", 0),
         "auto_starts": last_stream_snapshot.get("auto_starts", 0),
         "ended_at": last_stream_snapshot.get("ended_at")
+    }
+
+# 클라이언트 서버로부터 userId를 수신하는 API (cameraId 제거)
+@app.post("/client/user")
+async def receive_user_id(payload: Dict[str, Any] = Body(default={})):  # expects {"userId": string}
+    global last_user_info
+    # 기본 검증
+    if not isinstance(payload, dict):
+        return {"success": False, "message": "JSON body가 필요합니다."}
+    user_id = payload.get("userId")
+    if not user_id or not isinstance(user_id, str):
+        return {"success": False, "message": "userId(string)은 필수입니다."}
+
+    ts = datetime.now().isoformat(timespec='seconds')
+    last_user_info = {
+        "userId": user_id,
+        "received_at": ts,
+    }
+    return {
+        "success": True,
+        "message": "userId 수신 완료",
+    "received": {"userId": user_id},
+        "storedAt": ts,
     }
 
 # Auto-recording debug endpoint
