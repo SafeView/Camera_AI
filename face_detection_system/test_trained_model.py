@@ -10,7 +10,7 @@ import os
 from datetime import datetime
 
 class TrainedModelTester:
-    def __init__(self, base_url="http://localhost:8000"):
+    def __init__(self, base_url="http://localhost:8000/face-detection"):
         self.base_url = base_url
         self.video_filename = None
     
