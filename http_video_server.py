@@ -1592,14 +1592,7 @@ def detect_faces_at_time(video_path: str, start_minutes: int, start_seconds: int
                                     seconds = int(current_time % 60)
                                     
                                     detected_faces.append({
-                                        "face_id": unique_faces_count,
-                                        "filename": face_filename,
-                                        "detection_time": f"{minutes:02d}:{seconds:02d}",
-                                        "confidence": float(confidence),
-                                        "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                                        "file_path": face_path,
-                                        "s3_url": s3_url,
-                                        "face_hash": face_hash[:16] + "..."  # 해시 일부만 표시
+                                        "s3_url": s3_url
                                     })
             
             frame_count += 1
@@ -1612,22 +1605,7 @@ def detect_faces_at_time(video_path: str, start_minutes: int, start_seconds: int
         
         # 결과 요약 저장
         summary = {
-            "result_id": result_id,
-            "detection_info": {
-                "start_time": f"{start_minutes:02d}:{start_seconds:02d}",
-                "total_faces_detected": total_faces_detected,
-                "unique_faces_saved": unique_faces_count,
-                "processing_duration": f"{PROCESSING_DURATION_SECONDS}초",
-                "faces_directory": faces_dir,
-                "duplicate_removal_method": "Image Hash Similarity"
-            },
-            "faces": detected_faces,
-            "video_info": {
-                "duration": duration,
-                "total_frames": total_frames,
-                "fps": fps,
-                "start_frame": start_frame
-            }
+            "faces": detected_faces
         }
         
         # 결과 JSON 저장
