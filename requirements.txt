@@ -8,3 +8,4 @@ requests
 mysql-connector-python
 aiohttp
 websockets
+ultralytics>=8.0.0
