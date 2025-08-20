@@ -19,6 +19,7 @@ import aiohttp
 import asyncio
 from typing import Dict, Any
 import shutil
+import base64
 
 # Optional: lightweight person detector via AnalyticsEngine
 try:
@@ -26,7 +27,7 @@ try:
 except Exception:
     AnalyticsEngine = None  # type: ignore
 
-# Optional: YOLOv8 for fight detection
+# Optional: YOLOv8 (used by face detector when available)
 try:
     from ultralytics import YOLO  # type: ignore
 except Exception:
@@ -104,6 +105,26 @@ _auto_debug = {
     "last_error": None,
 }
 
+# Non-blocking WebSocket send with coalescing of pending frames
+async def _ws_send_coalesced(websocket: WebSocket, ws_id: int, first_bytes: bytes):
+    try:
+        await websocket.send_bytes(first_bytes)
+        # send the latest pending if writer got ahead
+        while True:
+            st = stream_stats.get(ws_id)
+            if not st:
+                break
+            pending = st.pop("pending_jpg", None)
+            if not pending:
+                break
+            await websocket.send_bytes(pending)
+    except Exception:
+        pass
+    finally:
+        st = stream_stats.get(ws_id)
+        if st is not None:
+            st["send_busy"] = False
+
 # Last time we saw at least 1 person (epoch seconds)
 _last_nonzero_person_ts: float | None = None
 # First time we detected zero persons after being non-zero (epoch seconds)
@@ -140,8 +161,10 @@ if AnalyticsEngine is not None:
         )
         if AUTO_RECORD_DEBUG:
             print("[AUTO] AnalyticsEngine initialized for person counting")
+## (fight detection settings API removed)
     except Exception as _e:
         print(f"Auto-record AnalyticsEngine init failed: {_e}")
+
 
 # Fallback HOG person detector (if YOLO unavailable)
 _HOG = None
@@ -182,128 +205,7 @@ def _estimate_person_count(frame: np.ndarray) -> int:
         _auto_debug["last_error"] = f"HOG detect error: {e}"
     return 0
 
-# ---------------- Fight detection (trained model) ----------------
-FIGHT_MODEL = None
-FIGHT_DETECT_ENABLED = False
-FIGHT_CONF = float(os.getenv("FIGHT_CONF", "0.75"))  # stricter default
-FIGHT_IOU = float(os.getenv("FIGHT_IOU", "0.45"))
-FIGHT_SAMPLE_EVERY_N_FRAMES = int(os.getenv("FIGHT_SAMPLE_EVERY_N_FRAMES", "5"))  # run detector every N frames
-FIGHT_DRAW_OVERLAY = True
-FIGHT_TRIGGER_RECORDING = False  # if True, detection triggers recording start
-FIGHT_ALERT_COOLDOWN_SEC = float(os.getenv("FIGHT_ALERT_COOLDOWN_SEC", "8.0"))
-FIGHT_MIN_BOX_AREA_RATIO = float(os.getenv("FIGHT_MIN_BOX_AREA_RATIO", "0.05"))  # min bbox area vs frame
-FIGHT_CONSECUTIVE_HITS = int(os.getenv("FIGHT_CONSECUTIVE_HITS", "3"))  # require hits before alert
-FIGHT_MOTION_GATE_ENABLED = os.getenv("FIGHT_MOTION_GATE_ENABLED", "true").lower() in ("1", "true", "yes")
-FIGHT_MOTION_DELTA_THRESH = float(os.getenv("FIGHT_MOTION_DELTA_THRESH", "0.02"))  # normalized [0..1] mean diff
-FIGHT_MIN_PERSONS = int(os.getenv("FIGHT_MIN_PERSONS", "2"))
-FIGHT_STRONG_CONF = float(os.getenv("FIGHT_STRONG_CONF", "0.9"))
-FIGHT_TRACK_IOU_THRESH = float(os.getenv("FIGHT_TRACK_IOU_THRESH", "0.3"))
-FIGHT_DIAGNOSTIC_MODE = False  # when True, send probe messages with raw/gated counts
-FIGHT_BYPASS_GATES = False     # when True, use raw detections (conf/iou only) for alerting
-
-_fight_prev_gray: Dict[int, np.ndarray] = {}
-
-_fight_debug = {
-    "model_path": None,
-    "loaded": False,
-    "last_infer_ms": None,
-    "last_event_at": None,
-    "last_count": 0,
-    "last_error": None,
-}
-
-# Try loading trained fight model
-try:
-    fight_model_path = None
-    # Allow override via yolo_config.json
-    cfg_path = os.path.join(os.getcwd(), "yolo_config.json")
-    if os.path.exists(cfg_path):
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            try:
-                _cfg = json.load(f)
-                if isinstance(_cfg, dict):
-                    fight_model_path = _cfg.get("yolo_fight_model")
-            except Exception:
-                pass
-    # Fallback to last trained path if present
-    if not fight_model_path:
-        candidate = os.path.join(os.getcwd(), "runs", "fight", "yolov8n-fight3", "weights", "best.pt")
-        if os.path.exists(candidate):
-            fight_model_path = candidate
-    if YOLO is not None and fight_model_path and os.path.exists(fight_model_path):
-        FIGHT_MODEL = YOLO(fight_model_path)
-        _fight_debug["model_path"] = fight_model_path
-        _fight_debug["loaded"] = True
-        print(f"[FIGHT] Model loaded: {fight_model_path}")
-    else:
-        if YOLO is None:
-            print("[FIGHT] ultralytics not available; fight detection disabled")
-        else:
-            print(f"[FIGHT] Model not found; set 'yolo_fight_model' in yolo_config.json")
-except Exception as _fe:
-    _fight_debug["last_error"] = f"init error: {_fe}"
-    print(f"[FIGHT] Init failed: {_fe}")
-
-def _detect_fight(frame: np.ndarray):
-    """Run fight detector and return list of detections: [(x1,y1,x2,y2,conf), ...]"""
-    if FIGHT_MODEL is None or not FIGHT_DETECT_ENABLED:
-        return []
-    t0 = time.time()
-    try:
-        # Run single-image prediction
-        results = FIGHT_MODEL(
-            frame,
-            conf=FIGHT_CONF,
-            iou=FIGHT_IOU,
-            verbose=False,
-        )
-        dets = []
-        if results and len(results) > 0:
-            r0 = results[0]
-            if hasattr(r0, 'boxes') and r0.boxes is not None and hasattr(r0.boxes, 'xyxy'):
-                xyxy = r0.boxes.xyxy
-                confs = r0.boxes.conf if hasattr(r0.boxes, 'conf') else None
-                if xyxy is not None:
-                    import torch  # type: ignore
-                    n = xyxy.shape[0] if isinstance(xyxy, (np.ndarray,)) else int(getattr(xyxy, 'shape', [0])[0])
-                    for i in range(n):
-                        try:
-                            if hasattr(xyxy, 'cpu'):
-                                x1, y1, x2, y2 = xyxy[i].cpu().numpy().tolist()
-                            else:
-                                x1, y1, x2, y2 = [float(v) for v in xyxy[i]]
-                            conf = float(confs[i].item()) if confs is not None else None
-                            if conf is None or conf >= FIGHT_CONF:
-                                dets.append((int(x1), int(y1), int(x2), int(y2), float(conf or 0.0)))
-                        except Exception:
-                            continue
-        _fight_debug["last_infer_ms"] = round((time.time() - t0) * 1000.0, 1)
-        _fight_debug["last_count"] = len(dets)
-        return dets
-    except Exception as e:
-        _fight_debug["last_error"] = f"infer error: {e}"
-        return []
-
-def _box_iou_xyxy(a, b) -> float:
-    """IoU between boxes a,b in (x1,y1,x2,y2)."""
-    try:
-        ax1, ay1, ax2, ay2 = a
-        bx1, by1, bx2, by2 = b
-        inter_x1 = max(ax1, bx1)
-        inter_y1 = max(ay1, by1)
-        inter_x2 = min(ax2, bx2)
-        inter_y2 = min(ay2, by2)
-        inter_w = max(0, inter_x2 - inter_x1)
-        inter_h = max(0, inter_y2 - inter_y1)
-        inter = inter_w * inter_h
-        if inter == 0:
-            return 0.0
-        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
-        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
-        denom = area_a + area_b - inter
-        return float(inter / denom) if denom > 0 else 0.0
-    except Exception:
-        return 0.0
+# (Fight detection feature removed)
 
 # S3 설정 (환경변수로 설정 권장)
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
@@ -368,7 +270,6 @@ def initialize_face_detector():
             try:
                 import torch
                 # PyTorch 2.6+ 호환성을 위한 환경 변수 설정
-                import os
                 os.environ['TORCH_WEIGHTS_ONLY'] = 'False'
                 
                 # torch.load의 기본값을 False로 설정
@@ -467,6 +368,93 @@ def is_duplicate_face(face_hash: str, bbox: list = None) -> bool:
                 return True
     
     return False
+
+# ---------------- Face validation helpers to reduce false positives ----------------
+try:
+    _HAAR_FRONTAL = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+except Exception:
+    _HAAR_FRONTAL = cv2.CascadeClassifier()
+try:
+    _HAAR_PROFILE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_profileface.xml')
+except Exception:
+    _HAAR_PROFILE = cv2.CascadeClassifier()
+
+def _verify_face_region(img: np.ndarray) -> bool:
+    """Return True if a face is detected in the region using Haar cascades (frontal/profile)."""
+    try:
+        if img is None or img.size == 0:
+            return False
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        found = False
+        if not _HAAR_FRONTAL.empty():
+            faces = _HAAR_FRONTAL.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(24, 24))
+            if len(faces) > 0:
+                found = True
+        if not found and not _HAAR_PROFILE.empty():
+            prof = _HAAR_PROFILE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(24, 24))
+            if len(prof) > 0:
+                found = True
+            else:
+                # Try mirrored for opposite profile
+                gray_flip = cv2.flip(gray, 1)
+                prof2 = _HAAR_PROFILE.detectMultiScale(gray_flip, scaleFactor=1.1, minNeighbors=3, minSize=(24, 24))
+                if len(prof2) > 0:
+                    found = True
+        return found
+    except Exception:
+        return False
+
+def _detect_faces_cascade(frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Detect faces on the whole frame using Haar cascades and return boxes as (x1,y1,x2,y2)."""
+    boxes: list[tuple[int, int, int, int]] = []
+    try:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        if not _HAAR_FRONTAL.empty():
+            faces = _HAAR_FRONTAL.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(32, 32))
+            for (x, y, w, h) in faces:
+                boxes.append((int(x), int(y), int(x + w), int(y + h)))
+        if not _HAAR_PROFILE.empty():
+            prof = _HAAR_PROFILE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(32, 32))
+            for (x, y, w, h) in prof:
+                boxes.append((int(x), int(y), int(x + w), int(y + h)))
+            # mirrored for other side
+            gray_flip = cv2.flip(gray, 1)
+            prof2 = _HAAR_PROFILE.detectMultiScale(gray_flip, scaleFactor=1.1, minNeighbors=4, minSize=(32, 32))
+            w_img = frame.shape[1]
+            for (x, y, w, h) in prof2:
+                # map back from flipped
+                x1 = w_img - (x + w)
+                boxes.append((int(x1), int(y), int(x1 + w), int(y + h)))
+    except Exception:
+        pass
+    return boxes
+
+def _iou(a: tuple[int,int,int,int], b: tuple[int,int,int,int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter = inter_w * inter_h
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    return (inter / union) if union > 0 else 0.0
+
+def _nms(boxes: list[tuple[int,int,int,int]], iou_thresh: float = 0.4) -> list[tuple[int,int,int,int]]:
+    if not boxes:
+        return []
+    keep: list[tuple[int,int,int,int]] = []
+    boxes_sorted = sorted(boxes, key=lambda b: (b[2]-b[0])*(b[3]-b[1]), reverse=True)
+    for b in boxes_sorted:
+        if all(_iou(b, k) < iou_thresh for k in keep):
+            keep.append(b)
+    return keep
 
 def upload_face_to_s3(image_path: str, s3_key: str) -> str:
     """얼굴 이미지를 S3에 업로드하고 URL 반환"""
@@ -1064,141 +1052,7 @@ async def unified_video_ws(websocket: WebSocket):
                         print(f"Auto record check error: {e}")
                         _auto_debug["last_error"] = f"check error: {e}"
                     
-                    # --- Fight detection per N frames with gating ---
-                    try:
-                        if FIGHT_MODEL is not None and FIGHT_DETECT_ENABLED:
-                            st = stream_stats.get(websocket_id)
-                            frame_idx = int(st.get("frame_idx", 0)) if st else 0
-                            run_now = (frame_idx % max(1, FIGHT_SAMPLE_EVERY_N_FRAMES) == 0)
-                            if st is not None:
-                                st["frame_idx"] = frame_idx + 1
-                            fight_dets = []
-                            fight_dets_raw = []
-                            if run_now:
-                                # motion gating
-                                motion_ok = True
-                                if FIGHT_MOTION_GATE_ENABLED:
-                                    try:
-                                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                                        prev = _fight_prev_gray.get(websocket_id)
-                                        if prev is not None and prev.shape == gray.shape:
-                                            diff = cv2.absdiff(gray, prev)
-                                            mean_norm = float(diff.mean()) / 255.0
-                                            motion_ok = mean_norm >= FIGHT_MOTION_DELTA_THRESH
-                                        _fight_prev_gray[websocket_id] = gray
-                                    except Exception:
-                                        pass
-                                if motion_ok:
-                                    fight_dets_raw = _detect_fight(frame)
-                                    fight_dets = list(fight_dets_raw)
-                                    # min box area gating
-                                    if fight_dets:
-                                        h, w = frame.shape[:2]
-                                        min_area = FIGHT_MIN_BOX_AREA_RATIO * (w * h)
-                                        fight_dets = [d for d in fight_dets if (d[2]-d[0])*(d[3]-d[1]) >= min_area]
-                                    # min persons gating unless strong conf
-                                    if fight_dets:
-                                        max_conf = max(d[4] for d in fight_dets if len(d) >= 5)
-                                        persons_now = int(_auto_debug.get("last_person_count", 0) or 0)
-                                        if persons_now < FIGHT_MIN_PERSONS and max_conf < FIGHT_STRONG_CONF:
-                                            fight_dets = []
-                                    # temporal IoU gating occurs later (before hits)
-
-                                # diagnostic: send raw vs gated probe
-                                if run_now and FIGHT_DIAGNOSTIC_MODE:
-                                    try:
-                                        raw_cnt = len(fight_dets_raw) if fight_dets_raw else 0
-                                        gated_cnt = len(fight_dets) if fight_dets else 0
-                                        max_conf_raw = max((d[4] for d in (fight_dets_raw or []) if len(d) >= 5), default=None)
-                                        # sanity check: gated should not exceed raw
-                                        if gated_cnt > raw_cnt:
-                                            _fight_debug["last_error"] = f"sanity: gated({gated_cnt})>raw({raw_cnt})"
-                                        await websocket.send_text(json.dumps({
-                                            "type": "fight_probe",
-                                            "raw_count": raw_cnt,
-                                            "gated_count": gated_cnt,
-                                            "max_conf_raw": max_conf_raw,
-                                            "conf_thres": FIGHT_CONF,
-                                            "iou_thres": FIGHT_IOU,
-                                            "min_box_area_ratio": FIGHT_MIN_BOX_AREA_RATIO,
-                                            "motion_gate_enabled": FIGHT_MOTION_GATE_ENABLED,
-                                            "motion_delta_thresh": FIGHT_MOTION_DELTA_THRESH,
-                                            "min_persons": FIGHT_MIN_PERSONS,
-                                            "current_persons": int(_auto_debug.get("last_person_count", 0) or 0),
-                                            "track_iou_thresh": FIGHT_TRACK_IOU_THRESH,
-                                            "consecutive_hits": FIGHT_CONSECUTIVE_HITS,
-                                            "bypass_gates": FIGHT_BYPASS_GATES,
-                                            "server_rev": SERVER_REV
-                                        }))
-                                    except Exception:
-                                        pass
-                                # draw overlay if enabled
-                                if FIGHT_DRAW_OVERLAY and fight_dets:
-                                    for (x1, y1, x2, y2, conf) in fight_dets:
-                                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                                        label = f"FIGHT {conf:.2f}"
-                                        cv2.putText(frame, label, (x1, max(0, y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-                                # consecutive hits + cooldown per-connection (with temporal IoU gating)
-                                # optionally bypass all gates for alerting
-                                if FIGHT_BYPASS_GATES:
-                                    fight_dets = fight_dets_raw
-
-                                if fight_dets:
-                                    hits = int(st.get("fight_hits", 0)) if st else 0
-                                    # IoU gating: keep only boxes that overlap previous boxes enough
-                                    prev_boxes = st.get("fight_prev_boxes") if st else None
-                                    gated = []
-                                    if prev_boxes:
-                                        for (x1, y1, x2, y2, conf) in fight_dets:
-                                            ious = [_box_iou_xyxy((x1, y1, x2, y2), (pb[0], pb[1], pb[2], pb[3])) for pb in prev_boxes]
-                                            if ious and max(ious) >= FIGHT_TRACK_IOU_THRESH:
-                                                gated.append((x1, y1, x2, y2, conf))
-                                    else:
-                                        gated = fight_dets
-                                    if st is not None:
-                                        st["fight_prev_boxes"] = [(d[0], d[1], d[2], d[3]) for d in fight_dets]
-                                    if not gated:
-                                        # no temporal consistency -> reset hits
-                                        if st is not None:
-                                            st["fight_hits"] = 0
-                                        raise StopIteration  # skip alerting path
-                                    hits += 1
-                                    if st is not None:
-                                        st["fight_hits"] = hits
-                                    if hits >= max(1, FIGHT_CONSECUTIVE_HITS):
-                                        now_ts = time.time()
-                                        last_evt = st.get("fight_last_evt") if st else None
-                                        cooldown_ok = (last_evt is None) or (now_ts - float(last_evt) >= FIGHT_ALERT_COOLDOWN_SEC)
-                                        if cooldown_ok:
-                                            if st is not None:
-                                                st["fight_last_evt"] = now_ts
-                                                st["fight_hits"] = 0  # reset
-                                            try:
-                                                payload = {
-                                                    "type": "fight_detected",
-                                                    "detections": [
-                                                        {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "conf": conf}
-                                                        for (x1, y1, x2, y2, conf) in fight_dets
-                                                    ],
-                                                    "count": len(fight_dets),
-                                                    "conf_thres": FIGHT_CONF,
-                                                }
-                                                await websocket.send_text(json.dumps(payload))
-                                            except Exception as _fe:
-                                                print(f"WS fight alert error: {_fe}")
-                                            # optional: trigger recording
-                                            if FIGHT_TRIGGER_RECORDING and (not AUTO_RECORD_TEMP_DISABLED) and not is_recording:
-                                                try:
-                                                    await _auto_start_recording_from_frame(frame, init_person_count=1, ws_id=websocket_id)
-                                                except Exception as _re:
-                                                    print(f"Auto start on fight error: {_re}")
-                                else:
-                                    # miss resets consecutive
-                                    if st is not None:
-                                        st["fight_hits"] = 0
-                                        st.pop("fight_prev_boxes", None)
-                    except Exception as _fx:
-                        _fight_debug["last_error"] = f"loop error: {_fx}"
+                    # (fight detection removed)
 
                     # 사용자 검증 상태에 따라 모자이크 적용 여부 결정
                     # 원본 프레임 보존 (raw)
@@ -1212,8 +1066,22 @@ async def unified_video_ws(websocket: WebSocket):
                     else:
                         # 미검증 사용자: 모자이크 적용 (원본 사본에 적용)
                         processed_frame = process_frame(raw_frame.copy(), mode="face_plate")
-                    
-                    _, jpg = cv2.imencode('.jpg', processed_frame)
+
+                    # 전송 최적화: 리사이즈 + JPEG 품질 조정
+                    display_frame = processed_frame
+                    try:
+                        max_w = int(os.getenv("STREAM_MAX_WIDTH", "960"))
+                        if max_w and max_w > 0:
+                            h0, w0 = display_frame.shape[:2]
+                            if w0 > max_w:
+                                sc = max_w / float(w0)
+                                display_frame = cv2.resize(display_frame, (int(w0 * sc), int(h0 * sc)))
+                    except Exception:
+                        display_frame = processed_frame
+                    q = int(os.getenv("STREAM_JPEG_QUALITY", "70"))
+                    q = max(1, min(100, q))
+                    _, jpg = cv2.imencode('.jpg', display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+                    jpg_bytes = jpg.tobytes()
                     
                     # 녹화 중이면 프레임 저장 (모자이크 및 원본 동시 저장)
                     with recording_lock:
@@ -1221,15 +1089,45 @@ async def unified_video_ws(websocket: WebSocket):
                             # 먼저 raw/original 프레임 기록 (모자이크 없음)
                             if video_writer_raw is not None:
                                 video_writer_raw.write(raw_frame)
-                            # 처리본(mosaic)은 원본 사본에 모자이크 적용 후 기록
+                            # 처리본(mosaic)은 이미 계산된 결과를 가능한 재사용
                             if video_writer is not None:
                                 try:
-                                    rec_proc_frame = process_frame(raw_frame.copy(), mode="face_plate")
+                                    if user_status.get("is_verified", False):
+                                        # 화면은 원본이지만 저장은 모자이크 강제
+                                        rec_proc_frame = process_frame(raw_frame.copy(), mode="face_plate")
+                                    else:
+                                        rec_proc_frame = processed_frame
                                 except Exception:
-                                    rec_proc_frame = processed_frame  # fallback to displayed
+                                    rec_proc_frame = processed_frame  # fallback
                                 video_writer.write(rec_proc_frame)
                     
-                    await websocket.send_bytes(jpg.tobytes())
+                    # 전송 FPS 게이팅 + 넌블로킹 코앨레스 전송
+                    try:
+                        st = stream_stats.get(websocket_id)
+                        now_ts_gate = time.time()
+                        target_fps = float(os.getenv("STREAM_TARGET_FPS", "15"))
+                        can_send = True
+                        if target_fps and target_fps > 0:
+                            last_ts = float(st.get("last_stream_send_ts", 0)) if st else 0.0
+                            min_gap = 1.0 / target_fps
+                            if (now_ts_gate - last_ts) < min_gap:
+                                can_send = False
+                            else:
+                                if st is not None:
+                                    st["last_stream_send_ts"] = now_ts_gate
+                        if can_send:
+                            if st is not None and st.get("send_busy"):
+                                st["pending_jpg"] = jpg_bytes
+                            else:
+                                if st is not None:
+                                    st["send_busy"] = True
+                                asyncio.create_task(_ws_send_coalesced(websocket, websocket_id, jpg_bytes))
+                    except Exception:
+                        # fallback to blocking send on error
+                        try:
+                            await websocket.send_bytes(jpg_bytes)
+                        except Exception:
+                            pass
                     
             except WebSocketDisconnect:
                 break
@@ -1245,11 +1143,7 @@ async def unified_video_ws(websocket: WebSocket):
         with verification_lock:
             if websocket_id in verified_users:
                 del verified_users[websocket_id]
-        # fight prev gray cleanup
-        try:
-            _fight_prev_gray.pop(websocket_id, None)
-        except Exception:
-            pass
+    # (fight detection state cleanup removed)
         # 스트림 상태 비활성 처리
         try:
             if websocket_id in stream_stats:
@@ -1355,84 +1249,7 @@ async def set_auto_recording(payload: Dict[str, Any] = Body(default={})):  # exp
         "enabled": AUTO_RECORD_ENABLED,
         "threshold": AUTO_RECORD_THRESHOLD
     }
-
-# ---- Fight detection settings API ----
-@app.get("/fight_config")
-async def get_fight_config():
-    return {
-        "enabled": FIGHT_DETECT_ENABLED,
-        "conf": FIGHT_CONF,
-        "iou": FIGHT_IOU,
-        "sample_every_n_frames": FIGHT_SAMPLE_EVERY_N_FRAMES,
-        "draw_overlay": FIGHT_DRAW_OVERLAY,
-        "trigger_recording": FIGHT_TRIGGER_RECORDING,
-    "alert_cooldown_sec": FIGHT_ALERT_COOLDOWN_SEC,
-    "min_box_area_ratio": FIGHT_MIN_BOX_AREA_RATIO,
-    "consecutive_hits": FIGHT_CONSECUTIVE_HITS,
-    "motion_gate_enabled": FIGHT_MOTION_GATE_ENABLED,
-    "motion_delta_thresh": FIGHT_MOTION_DELTA_THRESH,
-    "min_persons": FIGHT_MIN_PERSONS,
-    "strong_conf": FIGHT_STRONG_CONF,
-    "track_iou_thresh": FIGHT_TRACK_IOU_THRESH,
-    "diagnostic_mode": FIGHT_DIAGNOSTIC_MODE,
-    "bypass_gates": FIGHT_BYPASS_GATES,
-        "model_loaded": FIGHT_MODEL is not None,
-        "model_path": _fight_debug.get("model_path"),
-    "server_rev": SERVER_REV,
-    "last_error": _fight_debug.get("last_error"),
-    }
-
-
-@app.post("/fight_config")
-async def set_fight_config(payload: Dict[str, Any] = Body(default={})):  # expects optional fields
-    global FIGHT_DETECT_ENABLED, FIGHT_CONF, FIGHT_IOU, FIGHT_SAMPLE_EVERY_N_FRAMES, FIGHT_DRAW_OVERLAY, FIGHT_TRIGGER_RECORDING
-    global FIGHT_ALERT_COOLDOWN_SEC, FIGHT_MIN_BOX_AREA_RATIO, FIGHT_CONSECUTIVE_HITS, FIGHT_MOTION_GATE_ENABLED, FIGHT_MOTION_DELTA_THRESH
-    global FIGHT_MIN_PERSONS, FIGHT_STRONG_CONF, FIGHT_TRACK_IOU_THRESH, FIGHT_DIAGNOSTIC_MODE, FIGHT_BYPASS_GATES
-    if not isinstance(payload, dict):
-        return {"error": "Invalid body"}
-    try:
-        if "enabled" in payload:
-            FIGHT_DETECT_ENABLED = bool(payload["enabled"])
-        if "conf" in payload:
-            FIGHT_CONF = float(payload["conf"])
-        if "iou" in payload:
-            FIGHT_IOU = float(payload["iou"])
-        if "sample_every_n_frames" in payload:
-            v = int(payload["sample_every_n_frames"])
-            FIGHT_SAMPLE_EVERY_N_FRAMES = max(1, v)
-        if "draw_overlay" in payload:
-            FIGHT_DRAW_OVERLAY = bool(payload["draw_overlay"])
-        if "trigger_recording" in payload:
-            FIGHT_TRIGGER_RECORDING = bool(payload["trigger_recording"])
-        if "alert_cooldown_sec" in payload:
-            FIGHT_ALERT_COOLDOWN_SEC = float(payload["alert_cooldown_sec"])
-        if "min_box_area_ratio" in payload:
-            FIGHT_MIN_BOX_AREA_RATIO = float(payload["min_box_area_ratio"])
-        if "consecutive_hits" in payload:
-            FIGHT_CONSECUTIVE_HITS = max(1, int(payload["consecutive_hits"]))
-        if "motion_gate_enabled" in payload:
-            FIGHT_MOTION_GATE_ENABLED = bool(payload["motion_gate_enabled"])
-        if "motion_delta_thresh" in payload:
-            FIGHT_MOTION_DELTA_THRESH = float(payload["motion_delta_thresh"])
-        if "min_persons" in payload:
-            FIGHT_MIN_PERSONS = max(0, int(payload["min_persons"]))
-        if "strong_conf" in payload:
-            FIGHT_STRONG_CONF = float(payload["strong_conf"])
-        if "track_iou_thresh" in payload:
-            FIGHT_TRACK_IOU_THRESH = float(payload["track_iou_thresh"])
-        if "diagnostic_mode" in payload:
-            FIGHT_DIAGNOSTIC_MODE = bool(payload["diagnostic_mode"])
-        if "bypass_gates" in payload:
-            FIGHT_BYPASS_GATES = bool(payload["bypass_gates"]) 
-    except Exception:
-        return {"error": "Invalid values in body"}
-    return await get_fight_config()
-
-
-@app.get("/fight_debug")
-async def fight_debug():
-    d = dict(_fight_debug)
-    return d
+## (fight detection endpoints removed)
 
 # 녹화 시작 엔드포인트
 @app.post("/start_recording")
@@ -1683,6 +1500,36 @@ def detect_faces_at_time(video_path: str, start_minutes: int, start_seconds: int
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         
         frame_count = start_frame
+        # 모델이 얼굴 클래스 제공하는지 확인
+        detector_names = None
+        try:
+            detector_names = getattr(detector, 'names', None)
+            if detector_names is None and hasattr(detector, 'model'):
+                detector_names = getattr(detector.model, 'names', None)
+        except Exception:
+            detector_names = None
+
+        def _is_face_class(result_obj, cls_id: int) -> bool:
+            try:
+                # 우선순위: result.names -> detector names -> fallback 문자열 비교
+                names_map = getattr(result_obj, 'names', None) or detector_names
+                if isinstance(names_map, dict) and cls_id in names_map:
+                    return 'face' in str(names_map[cls_id]).lower()
+                if isinstance(names_map, (list, tuple)) and 0 <= cls_id < len(names_map):
+                    return 'face' in str(names_map[cls_id]).lower()
+            except Exception:
+                pass
+            # 이름을 알 수 없으면 보수적으로 False
+            return False
+
+        def _box_valid_shape(x1, y1, x2, y2) -> bool:
+            w = max(0, x2 - x1)
+            h = max(0, y2 - y1)
+            if w < 24 or h < 24:
+                return False
+            ar = (w / h) if h > 0 else 0
+            return 0.6 <= ar <= 1.8
+
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -1690,59 +1537,65 @@ def detect_faces_at_time(video_path: str, start_minutes: int, start_seconds: int
             
             # 1초마다 프레임 처리 (성능 최적화)
             if frame_count % int(fps) == 0:
-                # 얼굴 검출 (YOLOv8)
+                candidate_boxes: list[tuple[int,int,int,int]] = []
+                used_cascade = False
+
+                # 1) YOLO 얼굴 모델이면 YOLO 결과 사용 + 검증
                 if hasattr(detector, 'predict'):
-                    results = detector(frame, verbose=False)
-                    
-                    for result in results:
-                        boxes = result.boxes
-                        if boxes is not None:
+                    try:
+                        results = detector(frame, verbose=False)
+                        for result in results:
+                            boxes = getattr(result, 'boxes', None)
+                            if boxes is None:
+                                continue
                             for box in boxes:
-                                # 신뢰도 확인
-                                confidence = float(box.conf[0])
-                                if confidence < FACE_DETECTION_CONFIDENCE_THRESHOLD:
+                                conf = float(box.conf[0]) if hasattr(box, 'conf') else 1.0
+                                if conf < FACE_DETECTION_CONFIDENCE_THRESHOLD:
                                     continue
-                                
-                                # 바운딩 박스 좌표
+                                # 클래스 이름이 face인지 확인 (모델에 face 클래스가 없는 경우 건너뜀)
+                                cls_id = int(box.cls[0]) if hasattr(box, 'cls') else -1
+                                if not _is_face_class(result, cls_id):
+                                    continue
                                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                                
-                                # 얼굴 영역 추출
-                                face_image = frame[y1:y2, x1:x2]
-                                if face_image.size == 0:
+                                if not _box_valid_shape(x1, y1, x2, y2):
                                     continue
-                                
-                                # 얼굴 해시 계산
-                                face_hash = calculate_image_hash(face_image)
-                                if face_hash is None:
+                                roi = frame[y1:y2, x1:x2]
+                                if not _verify_face_region(roi):
                                     continue
-                                
-                                total_faces_detected += 1
-                                
-                                # 중복 검사
-                                bbox_coords = [int(x1), int(y1), int(x2), int(y2)]
-                                if not is_duplicate_face(face_hash, bbox_coords):
-                                    # 새로운 얼굴이면 저장
-                                    face_hashes.append(face_hash)
-                                    face_bboxes.append(bbox_coords)
-                                    unique_faces_count += 1
-                                    
-                                    # 얼굴 이미지 저장
-                                    face_filename = f"face_{unique_faces_count:03d}_{timestamp}.jpg"
-                                    face_path = os.path.join(faces_dir, face_filename)
-                                    cv2.imwrite(face_path, face_image)
-                                    
-                                    # S3 업로드
-                                    s3_key = f"api_results/{result_id}/faces/{face_filename}"
-                                    s3_url = upload_face_to_s3(face_path, s3_key)
-                                    
-                                    # 검출 정보 저장
-                                    current_time = frame_count / fps
-                                    minutes = int(current_time // 60)
-                                    seconds = int(current_time % 60)
-                                    
-                                    detected_faces.append({
-                                        "s3_url": s3_url
-                                    })
+                                candidate_boxes.append((x1, y1, x2, y2))
+                    except Exception:
+                        pass
+
+                # 2) face 클래스가 전혀 안 나왔다면 Haar cascade로 대체
+                if not candidate_boxes:
+                    used_cascade = True
+                    candidate_boxes = _detect_faces_cascade(frame)
+
+                # NMS로 정리
+                final_boxes = _nms(candidate_boxes, iou_thresh=0.45)
+
+                for (x1, y1, x2, y2) in final_boxes:
+                    face_image = frame[y1:y2, x1:x2]
+                    if face_image is None or face_image.size == 0:
+                        continue
+                    # cascade에서 온 경우에도 한 번 더 빠른 검증
+                    if used_cascade and not _box_valid_shape(x1, y1, x2, y2):
+                        continue
+                    face_hash = calculate_image_hash(face_image)
+                    if not face_hash:
+                        continue
+                    total_faces_detected += 1
+                    bbox_coords = [int(x1), int(y1), int(x2), int(y2)]
+                    if not is_duplicate_face(face_hash, bbox_coords):
+                        face_hashes.append(face_hash)
+                        face_bboxes.append(bbox_coords)
+                        unique_faces_count += 1
+                        face_filename = f"face_{unique_faces_count:03d}_{timestamp}.jpg"
+                        face_path = os.path.join(faces_dir, face_filename)
+                        cv2.imwrite(face_path, face_image)
+                        s3_key = f"api_results/{result_id}/faces/{face_filename}"
+                        s3_url = upload_face_to_s3(face_path, s3_key)
+                        detected_faces.append({"s3_url": s3_url})
             
             frame_count += 1
             
@@ -1816,233 +1669,106 @@ async def detect_faces(
     filename: str = Query(None, description="비디오 파일명 (로컬 또는 S3)"),
     time_input: str = Query(..., description="시작 시간 (예: '1 30' = 1분 30초부터, '90' = 90초부터)"),
     from_s3: bool = Query(False, description="S3에서 파일을 가져올지 여부"),
-    video_url: str = Query(None, description="동영상 URL (filename 대신 사용)")
+    video_url: str = Query(None, description="동영상 URL (filename 대신 사용)"),
+    file: UploadFile = File(None),
 ):
-    """특정 시간부터 얼굴 검출"""
+    """특정 시간부터 얼굴 검출 (blob:/data: URL 및 직접 업로드 지원)"""
     try:
-        # 시간 입력 파싱
+        # 시간 입력 파싱 (분,초 또는 총초)
         try:
-            time_parts = time_input.split()
-            if len(time_parts) == 2:
-                start_minutes = int(time_parts[0])
-                start_seconds = int(time_parts[1])
-            elif len(time_parts) == 1:
-                total_seconds = int(time_parts[0])
+            parts = time_input.split()
+            if len(parts) == 2:
+                start_minutes = int(parts[0])
+                start_seconds = int(parts[1])
+            elif len(parts) == 1:
+                total_seconds = int(parts[0])
                 start_minutes = total_seconds // 60
                 start_seconds = total_seconds % 60
             else:
                 raise ValueError("잘못된 시간 형식입니다. '1 30' 또는 '90' 형식으로 입력하세요.")
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"시간 파싱 오류: {str(e)}")
-        
+
         file_path = None
-        
+        temp_created = False
+
         if video_url:
-            # URL에서 동영상 스트리밍 처리
-            try:
-                import requests
-                import cv2
-                import numpy as np
-                
-                print(f"URL에서 동영상 스트리밍 시작: {video_url}")
-                
-                # OpenCV로 직접 URL 스트리밍
-                cap = cv2.VideoCapture(video_url)
-                if not cap.isOpened():
-                    raise Exception("동영상 URL을 열 수 없습니다")
-                
-                # 동영상 정보 가져오기
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                duration = total_frames / fps if fps > 0 else 0
-                
-                # 시작 프레임 계산
-                start_time_seconds = start_minutes * 60 + start_seconds
-                start_frame = int(start_time_seconds * fps)
-                
-                # 입력 시간 검증
-                if start_time_seconds > duration:
-                    cap.release()
-                    return JSONResponse(content={
-                        "error": f"입력한 시간({start_minutes}분 {start_seconds}초)이 동영상 길이({duration:.1f}초)를 초과합니다.",
-                        "video_info": {
-                            "duration": duration,
-                            "total_frames": total_frames,
-                            "fps": fps
-                        }
-                    }, status_code=400)
-                
-                # 결과 저장 디렉토리 생성
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                result_id = f"time_detection_{timestamp}"
-                result_dir = os.path.join(api_results_dir, result_id)
-                faces_dir = os.path.join(result_dir, "faces")
-                os.makedirs(faces_dir, exist_ok=True)
-                
-                # 얼굴 검출 결과
-                detected_faces = []
-                unique_faces_count = 0
-                total_faces_detected = 0
-                
-                # 얼굴 해시 및 바운딩 박스 초기화
-                face_hashes = []
-                face_bboxes = []
-                
-                # 시작 프레임으로 이동
-                cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-                
-                frame_count = start_frame
-                detector = initialize_face_detector()
-                
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    
-                    # 1초마다 프레임 처리 (성능 최적화)
-                    if frame_count % int(fps) == 0:
-                        # 얼굴 검출 (YOLOv8)
-                        if hasattr(detector, 'predict'):
-                            results = detector(frame, verbose=False)
-                            
-                            for result in results:
-                                boxes = result.boxes
-                                if boxes is not None:
-                                    for box in boxes:
-                                        # 신뢰도 확인
-                                        confidence = float(box.conf[0])
-                                        if confidence < FACE_DETECTION_CONFIDENCE_THRESHOLD:
-                                            continue
-                                        
-                                        # 바운딩 박스 좌표
-                                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                                        
-                                        # 얼굴 영역 추출
-                                        face_image = frame[y1:y2, x1:x2]
-                                        if face_image.size == 0:
-                                            continue
-                                        
-                                        # 얼굴 해시 계산
-                                        face_hash = calculate_image_hash(face_image)
-                                        if face_hash is None:
-                                            continue
-                                        
-                                        total_faces_detected += 1
-                                        
-                                        # 중복 검사
-                                        bbox_coords = [int(x1), int(y1), int(x2), int(y2)]
-                                        if not is_duplicate_face(face_hash, bbox_coords):
-                                            # 새로운 얼굴이면 저장
-                                            face_hashes.append(face_hash)
-                                            face_bboxes.append(bbox_coords)
-                                            unique_faces_count += 1
-                                            
-                                            # 얼굴 이미지 저장
-                                            face_filename = f"face_{unique_faces_count:03d}_{timestamp}.jpg"
-                                            face_path = os.path.join(faces_dir, face_filename)
-                                            cv2.imwrite(face_path, face_image)
-                                            
-                                            # S3 업로드
-                                            s3_key = f"api_results/{result_id}/faces/{face_filename}"
-                                            s3_url = upload_face_to_s3(face_path, s3_key)
-                                            
-                                            detected_faces.append({
-                                                "s3_url": s3_url
-                                            })
-                    
-                    frame_count += 1
-                    
-                    # 환경 변수에서 설정한 시간 후 중단 (성능 최적화)
-                    if frame_count - start_frame > int(fps * PROCESSING_DURATION_SECONDS):
-                        break
-                
-                cap.release()
-                
-                # 결과 요약 저장
-                summary = {
-                    "faces": detected_faces
-                }
-                
-                # 결과 JSON 저장
-                summary_path = os.path.join(result_dir, "face_records.json")
-                with open(summary_path, 'w', encoding='utf-8') as f:
-                    json.dump(summary, f, ensure_ascii=False, indent=2)
-                
-                return summary
-                
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"URL에서 동영상 처리 실패: {str(e)}"
-                )
-        
+            # 1) blob: URL → 서버 직접 접근 불가, 업로드 파일 필요
+            if video_url.startswith("blob:"):
+                if file is None:
+                    raise HTTPException(status_code=400, detail=(
+                        "blob: URL은 서버에서 접근할 수 없습니다. 파일을 함께 업로드하시거나 "
+                        "먼저 /face-detection/upload-video로 업로드 후 filename으로 호출하세요."
+                    ))
+                temp_path = os.path.join(tempfile.gettempdir(), f"upload_{int(time.time())}_{file.filename or 'video'}.mp4")
+                with open(temp_path, "wb") as bf:
+                    shutil.copyfileobj(file.file, bf)
+                file_path = temp_path
+                temp_created = True
+            # 2) data: URL (data:video/mp4;base64,....)
+            elif video_url.startswith("data:"):
+                try:
+                    header, b64 = video_url.split(",", 1)
+                    raw = base64.b64decode(b64)
+                    temp_path = os.path.join(tempfile.gettempdir(), f"dataurl_{int(time.time())}.mp4")
+                    with open(temp_path, "wb") as ftmp:
+                        ftmp.write(raw)
+                    file_path = temp_path
+                    temp_created = True
+                except Exception as de:
+                    raise HTTPException(status_code=400, detail=f"data: URL 파싱 실패: {de}")
+            # 3) http(s) 등 → 다운로드 후 처리
+            else:
+                try:
+                    import requests
+                    tmp_path = os.path.join(tempfile.gettempdir(), f"url_dl_{int(time.time())}.mp4")
+                    with requests.get(video_url, stream=True, timeout=(5, 60)) as r:
+                        r.raise_for_status()
+                        with open(tmp_path, 'wb') as f:
+                            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                                if chunk:
+                                    f.write(chunk)
+                    file_path = tmp_path
+                    temp_created = True
+                except Exception as de:
+                    raise HTTPException(status_code=400, detail=f"URL 다운로드 실패: {de}")
         elif from_s3:
-            # S3에서 파일 다운로드
             if not USE_S3 or not s3_client:
-                raise HTTPException(
-                    status_code=400,
-                    detail="S3가 설정되지 않았습니다"
-                )
-            
+                raise HTTPException(status_code=400, detail="S3가 설정되지 않았습니다")
             try:
-                # S3에서 파일 존재 확인
                 s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=f"recordings/{filename}")
-                
-                # 임시 파일로 다운로드
                 temp_file = os.path.join(tempfile.gettempdir(), f"temp_{filename}")
                 s3_client.download_file(S3_BUCKET_NAME, f"recordings/{filename}", temp_file)
                 file_path = temp_file
-                
-                print(f"S3에서 파일 다운로드 완료: {filename} -> {temp_file}")
-                
-            except Exception as e:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"S3에서 파일을 찾을 수 없습니다: {filename}"
-                )
+            except Exception:
+                raise HTTPException(status_code=404, detail=f"S3에서 파일을 찾을 수 없습니다: {filename}")
         else:
-            # 로컬 파일 사용
-            if not filename:
-                raise HTTPException(
-                    status_code=400,
-                    detail="filename 또는 video_url 중 하나는 필수입니다"
-                )
-            
-            file_path = os.path.join(upload_dir, filename)
-            if not os.path.exists(file_path):
-                raise HTTPException(
-                    status_code=404, 
-                    detail="업로드된 비디오 파일을 찾을 수 없습니다"
-                )
-        
-        # 시간 입력 파싱
-        start_minutes, start_seconds = parse_time_input(time_input)
-        
-        # 얼굴 검출 실행
+            if file is not None:
+                temp_path = os.path.join(tempfile.gettempdir(), f"upload_{int(time.time())}_{file.filename or 'video'}.mp4")
+                with open(temp_path, "wb") as bf:
+                    shutil.copyfileobj(file.file, bf)
+                file_path = temp_path
+                temp_created = True
+            elif not filename:
+                raise HTTPException(status_code=400, detail="filename 또는 video_url 중 하나는 필수입니다")
+            else:
+                file_path = os.path.join(upload_dir, filename)
+                if not os.path.exists(file_path):
+                    raise HTTPException(status_code=404, detail="업로드된 비디오 파일을 찾을 수 없습니다")
+
+        # 최종 처리
         result = detect_faces_at_time(file_path, start_minutes, start_seconds)
-        
-        # 임시 파일 삭제 (S3 또는 URL에서 다운로드한 파일)
-        if (from_s3 or video_url) and file_path and os.path.exists(file_path):
+
+        # 임시 파일 삭제
+        if temp_created and file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
-                print(f"임시 파일 삭제: {file_path}")
-            except Exception as e:
-                print(f"임시 파일 삭제 실패: {e}")
-        
-        # 오류가 있는 경우
+            except Exception:
+                pass
+
         if "error" in result:
             return JSONResponse(content=result, status_code=400)
-        
         return result
-        
-    except ValueError as e:
-        return JSONResponse(
-            content={
-                "error": f"잘못된 시간 형식입니다: {time_input}",
-                "format_example": "올바른 형식: '1 30' (1분 30초) 또는 '90' (90초)"
-            },
-            status_code=400
-        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"얼굴 검출 오류: {str(e)}")
 
