@@ -1,12 +1,18 @@
 import cv2
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body, File, UploadFile, HTTPException
+ 
+
+
 from fastapi.responses import FileResponse, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+
+# 녹화 프레임 비동기 기록용 큐/워커
 from typing import Optional
 from AI_processor import process_frame
 import io
 import os
+
 from datetime import datetime
 import time
 import threading
@@ -83,6 +89,7 @@ _recording_started_at_ts: float | None = None
 _recording_max_persons: int = 0
 _recording_ws_id: int | None = None
 _manual_start_requested: bool = False
+_stop_task = None  # asyncio.Task | None, 자동 종료 시 백그라운드 태스크 핸들
 
 # Auto recording settings
 AUTO_RECORD_ENABLED = True
@@ -91,6 +98,15 @@ AUTO_ZERO_TIMEOUT_SEC = 3.0  # stop if no person for this duration
 AUTO_RECORD_DEBUG = True
 # TEMP: disable auto-recording behavior at runtime without deleting code
 AUTO_RECORD_TEMP_DISABLED = False  # auto-recording enabled
+
+# 성능 튜닝용 샘플링(기본값은 보수적으로 설정)
+DETECT_EVERY_N = int(os.getenv("DETECT_EVERY_N", "2"))           # 사람 수 추정은 N프레임마다 수행
+MOSAIC_EVERY_N = int(os.getenv("MOSAIC_EVERY_N", "1"))            # 모자이크는 N프레임마다 새로 계산(1이면 매 프레임)
+MOSAIC_PROCESS_MAX_WIDTH = int(os.getenv("MOSAIC_PROCESS_MAX_WIDTH", "0"))  # 모자이크 내부 처리용 축소 최대 폭(0이면 비활성)
+
+# Debounce settings for presence to prevent frequent start/stop flapping
+AUTO_PRESENCE_WINDOW = int(os.getenv("AUTO_PRESENCE_WINDOW", "20"))  # frames to look back
+AUTO_PRESENCE_MIN_HITS = int(os.getenv("AUTO_PRESENCE_MIN_HITS", "5"))  # min frames with presence in window to consider active
 
 # Debug state for auto recording
 _auto_debug = {
@@ -104,6 +120,8 @@ _auto_debug = {
     "started": False,
     "last_error": None,
 }
+
+ 
 
 # Non-blocking WebSocket send with coalescing of pending frames
 async def _ws_send_coalesced(websocket: WebSocket, ws_id: int, first_bytes: bytes):
@@ -528,82 +546,104 @@ async def _auto_start_recording_from_frame(frame: np.ndarray, init_person_count:
     h, w = frame.shape[:2]
     fps = 30.0
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+
+    def _open_writers() -> tuple[Any | None, Any | None, str, str]:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fn_proc = f"auto_recording_{ts}.mp4"
+        fn_raw = f"auto_recording_{ts}_raw.mp4"
+        path_proc = os.path.join(TEMP_DIR, fn_proc)
+        path_raw = os.path.join(TEMP_DIR, fn_raw)
+        vw_p = cv2.VideoWriter(path_proc, fourcc, fps, (w, h))
+        if not vw_p.isOpened():
+            try:
+                fallback_fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+                vw_p = cv2.VideoWriter(path_proc, fallback_fourcc, fps, (w, h))
+            except Exception:
+                pass
+        vw_r = cv2.VideoWriter(path_raw, fourcc, fps, (w, h))
+        if not vw_r.isOpened():
+            try:
+                fallback_fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+                vw_r = cv2.VideoWriter(path_raw, fallback_fourcc, fps, (w, h))
+            except Exception:
+                pass
+        return vw_p if vw_p is not None else None, vw_r if vw_r is not None else None, fn_proc, fn_raw
+
+    # 파일/코덱 초기화는 스레드에서 처리하여 이벤트 루프 블로킹 최소화
+    vw_proc, vw_raw, fn_proc, fn_raw = await asyncio.to_thread(_open_writers)
     with recording_lock:
         if is_recording:
+            # 경합 시 방금 연 것들 정리
+            try:
+                if vw_proc is not None:
+                    vw_proc.release()
+            except Exception:
+                pass
+            try:
+                if vw_raw is not None:
+                    vw_raw.release()
+            except Exception:
+                pass
             return
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # processed (mosaic) file
-        recording_filename = f"auto_recording_{timestamp}.mp4"
-        filepath_proc = os.path.join(TEMP_DIR, recording_filename)
-        vw_proc = cv2.VideoWriter(filepath_proc, fourcc, fps, (w, h))
-        if not vw_proc.isOpened():
-            # try fallback codec for processed
-            try:
-                fallback_fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-                vw_proc = cv2.VideoWriter(filepath_proc, fallback_fourcc, fps, (w, h))
-            except Exception:
-                pass
-
-        # raw file
-        recording_filename_raw = f"auto_recording_{timestamp}_raw.mp4"
-        filepath_raw = os.path.join(TEMP_DIR, recording_filename_raw)
-        vw_raw = cv2.VideoWriter(filepath_raw, fourcc, fps, (w, h))
-        if not vw_raw.isOpened():
-            # try fallback codec for raw
-            try:
-                fallback_fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-                vw_raw = cv2.VideoWriter(filepath_raw, fallback_fourcc, fps, (w, h))
-            except Exception:
-                pass
-
         # commit writers if at least one opened
         opened_any = False
         if vw_proc is not None and vw_proc.isOpened():
             video_writer = vw_proc
+            recording_filename = fn_proc
             opened_any = True
         else:
             video_writer = None
+            recording_filename = fn_proc
         if vw_raw is not None and vw_raw.isOpened():
             video_writer_raw = vw_raw
+            recording_filename_raw = fn_raw
             opened_any = True
         else:
             video_writer_raw = None
+            recording_filename_raw = fn_raw
 
-        if opened_any:
-            is_recording = True
-            _recording_started_at_ts = time.time()
-            _recording_max_persons = max(0, int(init_person_count))
-            _recording_ws_id = ws_id
-            print(f"Auto recording started: processed={recording_filename if video_writer else 'DISABLED'}, raw={recording_filename_raw if video_writer_raw else 'DISABLED'} ({w}x{h}@{fps}), storage={'S3' if USE_S3 else 'local'}")
-        else:
-            print("Failed to start auto recording (no VideoWriter opened)")
+    if opened_any:
+        is_recording = True
+        _recording_started_at_ts = time.time()
+        _recording_max_persons = max(0, int(init_person_count))
+        _recording_ws_id = ws_id
+        print(f"Auto recording started: processed={recording_filename if video_writer else 'DISABLED'}, raw={recording_filename_raw if video_writer_raw else 'DISABLED'} ({w}x{h}@{fps}), storage={'S3' if USE_S3 else 'local'}")
+    else:
+        print("Failed to start auto recording (no VideoWriter opened)")
 
 
-async def _stop_and_finalize_recording():
-    """Stop current recording and upload/move if needed. Returns dict result."""
+async def _stop_and_finalize_recording() -> Dict[str, Any]:
+    """Stop current recording and upload/move if needed. Returns dict result.
+
+    내부적으로 writer release는 즉시 수행하고, 업로드/파일 작업은 가능한 범위에서 스레드로 오프로딩합니다.
+    """
     global is_recording, video_writer, video_writer_raw, recording_filename, recording_filename_raw
+
+    # 1) writers release + 파일 목록 수집 (락 짧게 보유)
     with recording_lock:
         if not is_recording:
             return {"error": "Not recording"}
+        # Change state and release writers while holding the lock
         is_recording = False
-        if video_writer is not None:
-            try:
+        try:
+            if video_writer is not None:
                 video_writer.release()
-            except Exception:
-                pass
+        except Exception:
+            pass
+        finally:
             video_writer = None
-        if video_writer_raw is not None:
-            try:
+        try:
+            if video_writer_raw is not None:
                 video_writer_raw.release()
-            except Exception:
-                pass
+        except Exception:
+            pass
+        finally:
             video_writer_raw = None
 
         if not recording_filename and not recording_filename_raw:
             return {"status": "Recording stopped", "filenames": [], "storage": "local"}
 
-        # Build file list to upload
-        file_items = []
+        file_items: list[tuple[str, str]] = []
         if recording_filename:
             path_proc = os.path.join(TEMP_DIR, recording_filename)
             if os.path.exists(path_proc):
@@ -617,40 +657,132 @@ async def _stop_and_finalize_recording():
             else:
                 print(f"Recording stop requested but raw file missing: {path_raw}")
 
-        if not file_items:
-            return {"error": "Recording files not found"}
+    if not file_items:
+        return {"error": "Recording files not found"}
 
-        # If S3 configured, upload then delete local
-        if USE_S3 and s3_client:
-            urls = []
-            errors = []
-            for fname, fpath in file_items:
-                success, result = upload_to_s3(fpath, fname)
-                # remove local regardless
-                try:
-                    os.remove(fpath)
-                except Exception:
-                    pass
-                if success:
-                    urls.append(result)
-                    print(f"Recording finalized - uploaded to S3: {fname} -> {result}")
-                else:
-                    errors.append({"filename": fname, "error": result})
-                    print(f"Recording finalized - S3 upload failed: {fname}, error: {result}")
-            status_msg = "Recording stopped and uploaded to S3" if urls and not errors else (
-                "Recording stopped (partial upload to S3)" if urls and errors else "Recording stopped but S3 upload failed"
-            )
-            return {
-                "status": status_msg,
-                "filenames": [fi for fi, _ in file_items],
-                "s3_urls": urls,
-                "storage": "S3",
-                "error": None if not errors else errors,
-            }
-        # Else keep local file
+    # 2) 업로드/정리(락 바깥): 오프로딩 병렬 처리
+    if USE_S3 and s3_client:
+        async def _upload_one(fname: str, fpath: str) -> tuple[str, bool, str]:
+            success, result = await asyncio.to_thread(upload_to_s3, fpath, fname)
+            try:
+                os.remove(fpath)
+            except Exception:
+                pass
+            return fname, success, result
+
+        results = await asyncio.gather(*[_upload_one(fn, fp) for fn, fp in file_items], return_exceptions=False)
+        urls: list[str] = []
+        errors: list[Dict[str, Any]] = []
+        for fname, success, result in results:
+            if success:
+                urls.append(result)
+                print(f"Recording finalized - uploaded to S3: {fname} -> {result}")
+            else:
+                errors.append({"filename": fname, "error": result})
+                print(f"Recording finalized - S3 upload failed: {fname}, error: {result}")
+        status_msg = "Recording stopped and uploaded to S3" if urls and not errors else (
+            "Recording stopped (partial upload to S3)" if urls and errors else "Recording stopped but S3 upload failed"
+        )
+        return {
+            "status": status_msg,
+            "filenames": [fi for fi, _ in file_items],
+            "s3_urls": urls,
+            "storage": "S3",
+            "error": None if not errors else errors,
+        }
+    else:
         local_paths = [os.path.join(TEMP_DIR, fi) for fi, _ in file_items]
         print(f"Recording finalized - kept locally: {local_paths}")
         return {"status": "Recording stopped", "filenames": [fi for fi, _ in file_items], "local_paths": local_paths, "storage": "local"}
+
+async def _finalize_and_notify(websocket: WebSocket, started_ts: float | None, max_persons: int, rec_fn: str | None, rec_fn_raw: str | None) -> None:
+    """자동 종료를 백그라운드로 처리하고 WebSocket 알림 및 Spring 알림을 수행."""
+    global _recording_max_persons, _recording_ws_id, _recording_started_at_ts
+    res = await _stop_and_finalize_recording()
+    # WebSocket에 최종 알림 구성(처리본만 노출)
+    try:
+        duration = None
+        if started_ts is not None:
+            duration = round(time.time() - started_ts, 2)
+        # processed 파일 존재 여부 확인
+        proc_present = False
+        try:
+            if isinstance(res.get("filenames"), list) and rec_fn:
+                proc_present = any(fi == rec_fn for fi in res["filenames"])
+        except Exception:
+            proc_present = False
+        payload = {
+            "type": "auto_recording_finalized",
+            "filename": (rec_fn if proc_present else None),
+            "segment_max_persons": int(max_persons),
+            "duration_sec": duration,
+            "storage": res.get("storage"),
+        }
+        if res.get("s3_urls") and rec_fn:
+            try:
+                proc_url = next((u for u in res["s3_urls"] if isinstance(u, str) and u.endswith(f"/{rec_fn}")), None)
+            except Exception:
+                proc_url = None
+            if proc_url:
+                payload["s3_url"] = proc_url
+        if res.get("local_paths") and rec_fn:
+            try:
+                proc_local = next((p for p in res["local_paths"] if isinstance(p, str) and p.endswith(f"/{rec_fn}")), None)
+            except Exception:
+                proc_local = None
+            if proc_local:
+                payload["local_paths"] = [proc_local]
+            else:
+                payload["local_paths"] = []
+        await websocket.send_text(json.dumps(payload))
+    except Exception as _se:
+        print(f"WS notify error: {_se}")
+
+    # Spring 서버 알림(가능 시)
+    try:
+        if last_user_info and isinstance(last_user_info, dict):
+            uid = last_user_info.get("userId")
+            if isinstance(uid, str) and uid:
+                urls_for_spring: list[str] = []
+                try:
+                    if isinstance(res.get("s3_urls"), list):
+                        if rec_fn:
+                            proc_url = next((u for u in res["s3_urls"] if isinstance(u, str) and u.endswith(f"/{rec_fn}")), None)
+                            if proc_url:
+                                urls_for_spring.append(proc_url)
+                        if rec_fn_raw:
+                            raw_url = next((u for u in res["s3_urls"] if isinstance(u, str) and u.endswith(f"/{rec_fn_raw}")), None)
+                            if raw_url:
+                                urls_for_spring.append(raw_url)
+                except Exception:
+                    pass
+                try:
+                    if rec_fn and isinstance(res.get("local_paths"), list):
+                        need_proc = not any(isinstance(u, str) and u.endswith(f"/{rec_fn}") for u in urls_for_spring)
+                        if need_proc:
+                            proc_local = next((p for p in res["local_paths"] if isinstance(p, str) and p.endswith(f"/{rec_fn}")), None)
+                            if proc_local:
+                                urls_for_spring.append(proc_local)
+                    if rec_fn_raw and isinstance(res.get("local_paths"), list):
+                        need_raw = not any(isinstance(u, str) and u.endswith(f"/{rec_fn_raw}") for u in urls_for_spring)
+                        if need_raw:
+                            raw_local = next((p for p in res["local_paths"] if isinstance(p, str) and p.endswith(f"/{rec_fn_raw}")), None)
+                            if raw_local:
+                                urls_for_spring.append(raw_local)
+                except Exception:
+                    pass
+                if urls_for_spring:
+                    _prev = urls_for_spring[:2]
+                    _more = " ..." if len(urls_for_spring) > 2 else ""
+                    print(f"[SPRING] notify enqueue userId={uid}, urls={len(urls_for_spring)}: {_prev}{_more}")
+                    asyncio.create_task(_notify_spring_make_entity(uid, urls_for_spring))
+    except Exception as _spr_err:
+        print(f"[SPRING] notify error: {_spr_err}")
+
+    # 세션 상태 리셋
+    _recording_max_persons = 0
+    _recording_ws_id = None
+    _recording_started_at_ts = None
 
 # 키 검증 함수
 async def verify_key_with_backend(access_token: str, camera_id: str):
@@ -684,7 +816,7 @@ async def verify_key_with_backend(access_token: str, camera_id: str):
 @app.websocket("/ws/video")
 async def unified_video_ws(websocket: WebSocket):
     global is_recording, video_writer, recording_filename, _last_nonzero_person_ts, _zero_since_ts, last_stream_snapshot
-    global _recording_started_at_ts, _recording_max_persons, _recording_ws_id, _manual_start_requested
+    global _recording_started_at_ts, _recording_max_persons, _recording_ws_id, _manual_start_requested, _stop_task
     await websocket.accept()
     websocket_id = id(websocket)
     active_websockets.add(websocket)
@@ -818,10 +950,22 @@ async def unified_video_ws(websocket: WebSocket):
                             print("[AUTO] Received bytes but failed to decode frame")
                         continue
 
-                    # 자동 녹화: 인원 수 기준으로 시작
+                    # 자동 녹화: 인원 수 기준으로 시작 (진폭 완화용 히스토리 적용)
                     try:
                         # Estimate current person count
-                        pcnt = _estimate_person_count(frame)
+                        st = stream_stats.get(websocket_id)
+                        if st is None:
+                            st = {}
+                            stream_stats[websocket_id] = st
+                        idx = int(st.get("frame_idx", 0)) + 1
+                        st["frame_idx"] = idx
+
+                        if DETECT_EVERY_N <= 1 or (idx % max(1, DETECT_EVERY_N) == 0):
+                            # CPU 작업은 스레드로 오프로딩하여 이벤트 루프 블로킹 최소화
+                            pcnt = await asyncio.to_thread(_estimate_person_count, frame)
+                            st["last_pcnt"] = pcnt
+                        else:
+                            pcnt = int(st.get("last_pcnt", 0))
                         if AUTO_RECORD_DEBUG:
                             _auto_debug.update({
                                 "enabled": AUTO_RECORD_ENABLED,
@@ -841,16 +985,44 @@ async def unified_video_ws(websocket: WebSocket):
                                     st["detections"] = int(st.get("detections", 0)) + 1
                                 st["prev_person_count"] = pcnt
                                 st["last_updated"] = datetime.now().isoformat(timespec='seconds')
+                                # Presence history for debounce
+                                from collections import deque as _dq
+                                hist = st.get("presence_hist")
+                                if not isinstance(hist, _dq):
+                                    hist = _dq(maxlen=max(1, int(AUTO_PRESENCE_WINDOW)))
+                                    st["presence_hist"] = hist
+                                hist.append(1 if pcnt >= 1 else 0)
+                                hits = sum(hist)
+                                window_len = len(hist)
+                                st["presence_hits"] = hits
+                                st["presence_window"] = window_len
+                                if AUTO_RECORD_DEBUG:
+                                    _auto_debug["presence_hits"] = hits
+                                    _auto_debug["presence_window"] = window_len
                         except Exception:
                             pass
                         # auto-start when persons >= threshold
                         # Auto-start disabled guard
-                        if (
-                            not AUTO_RECORD_TEMP_DISABLED
-                            and pcnt >= AUTO_RECORD_THRESHOLD
-                            and not is_recording
-                            and AUTO_RECORD_ENABLED
-                        ):
+                        should_start = False
+                        try:
+                            st = stream_stats.get(websocket_id) or {}
+                            hits = int(st.get("presence_hits", 0))
+                            window_len = int(st.get("presence_window", 0))
+                            # Require both current pcnt >= threshold and sufficient recent presence
+                            if (
+                                not AUTO_RECORD_TEMP_DISABLED
+                                and not is_recording
+                                and AUTO_RECORD_ENABLED
+                                and pcnt >= AUTO_RECORD_THRESHOLD
+                                and hits >= max(1, int(AUTO_PRESENCE_MIN_HITS))
+                            ):
+                                should_start = True
+                        except Exception:
+                            # fallback to previous behavior on any error
+                            should_start = (
+                                not AUTO_RECORD_TEMP_DISABLED and pcnt >= AUTO_RECORD_THRESHOLD and not is_recording and AUTO_RECORD_ENABLED
+                            )
+                        if should_start:
                             _auto_debug["attempted_start"] = True
                             await _auto_start_recording_from_frame(frame, pcnt, websocket_id)
                             _auto_debug["started"] = is_recording
@@ -908,8 +1080,15 @@ async def unified_video_ws(websocket: WebSocket):
                                 _recording_max_persons = max(_recording_max_persons, int(pcnt))
                             except Exception:
                                 pass
-                        # update zero/nonzero timers with hysteresis
-                        if pcnt >= 1:
+                        # update zero/nonzero timers with debounce using presence history
+                        try:
+                            st = stream_stats.get(websocket_id) or {}
+                            hits = int(st.get("presence_hits", 0))
+                            window_len = int(st.get("presence_window", 0)) or 1
+                        except Exception:
+                            hits, window_len = (1 if pcnt >= 1 else 0), 1
+
+                        if hits > 0:
                             _last_nonzero_person_ts = now_ts
                             _zero_since_ts = None
                             _auto_debug.pop("zero_gap_sec", None)
@@ -918,135 +1097,27 @@ async def unified_video_ws(websocket: WebSocket):
                                 _zero_since_ts = now_ts
                             zero_gap = now_ts - _zero_since_ts
                             _auto_debug["zero_gap_sec"] = round(zero_gap, 2)
-                            # auto-stop when zero sustained beyond timeout
+                            # auto-stop when sustained zero presence beyond timeout
                             if (
                                 not AUTO_RECORD_TEMP_DISABLED
                                 and is_recording
                                 and zero_gap >= AUTO_ZERO_TIMEOUT_SEC
                             ):
-                                res = await _stop_and_finalize_recording()
-                                if AUTO_RECORD_DEBUG:
-                                    print(f"Auto stop after {zero_gap:.1f}s with zero persons -> {res}")
-                                # 자동 녹화 종료 알림(WebSocket 푸시)
-                                try:
-                                    duration = None
-                                    if _recording_started_at_ts is not None:
-                                        duration = round(time.time() - _recording_started_at_ts, 2)
-                                        # Build payload exposing only mosaic (processed) artifacts
-                                        # Spring 서버에 userId와 URL 목록 전송 (비동기, 베스트 에포트)
-                                        try:
-                                            if last_user_info and isinstance(last_user_info, dict):
-                                                uid = last_user_info.get("userId")
-                                                if isinstance(uid, str) and uid:
-                                                    urls_for_spring: list[str] = []
-                                                    # 1) S3에서 처리본/원본 URL 모두 수집 시도
-                                                    try:
-                                                        if isinstance(res.get("s3_urls"), list):
-                                                            if recording_filename:
-                                                                proc_url = next(
-                                                                    (
-                                                                        u for u in res["s3_urls"]
-                                                                        if isinstance(u, str) and u.endswith(f"/{recording_filename}")
-                                                                    ),
-                                                                    None,
-                                                                )
-                                                                if proc_url:
-                                                                    urls_for_spring.append(proc_url)
-                                                            if recording_filename_raw:
-                                                                raw_url = next(
-                                                                    (
-                                                                        u for u in res["s3_urls"]
-                                                                        if isinstance(u, str) and u.endswith(f"/{recording_filename_raw}")
-                                                                    ),
-                                                                    None,
-                                                                )
-                                                                if raw_url:
-                                                                    urls_for_spring.append(raw_url)
-                                                    except Exception:
-                                                        pass
-                                                    # 2) 비어있거나 일부만 있는 경우, 로컬 경로로 보완
-                                                    try:
-                                                        if recording_filename and isinstance(res.get("local_paths"), list):
-                                                            need_proc = not any(isinstance(u, str) and u.endswith(f"/{recording_filename}") for u in urls_for_spring)
-                                                            if need_proc:
-                                                                proc_local = next(
-                                                                    (
-                                                                        p for p in res["local_paths"]
-                                                                        if isinstance(p, str) and p.endswith(f"/{recording_filename}")
-                                                                    ),
-                                                                    None,
-                                                                )
-                                                                if proc_local:
-                                                                    urls_for_spring.append(proc_local)
-                                                        if recording_filename_raw and isinstance(res.get("local_paths"), list):
-                                                            need_raw = not any(isinstance(u, str) and u.endswith(f"/{recording_filename_raw}") for u in urls_for_spring)
-                                                            if need_raw:
-                                                                raw_local = next(
-                                                                    (
-                                                                        p for p in res["local_paths"]
-                                                                        if isinstance(p, str) and p.endswith(f"/{recording_filename_raw}")
-                                                                    ),
-                                                                    None,
-                                                                )
-                                                                if raw_local:
-                                                                    urls_for_spring.append(raw_local)
-                                                    except Exception:
-                                                        pass
-                                                    if urls_for_spring:
-                                                        _prev = urls_for_spring[:2]
-                                                        _more = " ..." if len(urls_for_spring) > 2 else ""
-                                                        print(f"[SPRING] notify enqueue userId={uid}, urls={len(urls_for_spring)}: {_prev}{_more}")
-                                                        asyncio.create_task(_notify_spring_make_entity(uid, urls_for_spring))
-                                                    else:
-                                                        print("[SPRING] skipping notify: no processed URL(s) to send")
-                                                else:
-                                                    print("[SPRING] skipping notify: invalid or missing userId")
-                                            else:
-                                                print("[SPRING] skipping notify: last_user_info not set")
-                                        except Exception as _spr_assemble_err:
-                                            print(f"[SPRING] notify assemble error: {_spr_assemble_err}")
-                                    # Determine if processed file actually exists in results
-                                    try:
-                                        proc_present = False
-                                        if isinstance(res.get("filenames"), list) and recording_filename:
-                                            proc_present = any(fi == recording_filename for fi in res["filenames"])
-                                    except Exception:
-                                        proc_present = False
-                                    payload = {
-                                        "type": "auto_recording_finalized",
-                                        # Only single processed filename (no array)
-                                        "filename": (recording_filename if proc_present else None),
-                                        "segment_max_persons": int(_recording_max_persons),
-                                        "duration_sec": duration,
-                                        "storage": res.get("storage"),
-                                    }
-                                    # If S3, include only the processed URL as a single s3_url (no array)
-                                    if res.get("s3_urls"):
-                                        proc_url = None
-                                        if recording_filename:
-                                            try:
-                                                proc_url = next((u for u in res["s3_urls"] if u.endswith(f"/{recording_filename}")), None)
-                                            except Exception:
-                                                proc_url = None
-                                        if proc_url:
-                                            payload["s3_url"] = proc_url
-                                    # If local, filter local_paths to only processed
-                                    if res.get("local_paths"):
-                                        proc_local = None
-                                        if recording_filename:
-                                            try:
-                                                proc_local = next((p for p in res["local_paths"] if p.endswith(f"/{recording_filename}")), None)
-                                            except Exception:
-                                                proc_local = None
-                                        payload["local_paths"] = [proc_local] if proc_local else []
-                                    await websocket.send_text(json.dumps(payload))
-                                except Exception as _se:
-                                    print(f"WS notify error: {_se}")
-                                finally:
-                                    # 세션 상태 리셋
-                                    _recording_max_persons = 0
-                                    _recording_ws_id = None
-                                    _recording_started_at_ts = None
+                                # 프레임 루프를 막지 않도록 백그라운드로 종료/업로드/알림 처리
+                                if _stop_task is None or _stop_task.done():
+                                    start_ts_snapshot = _recording_started_at_ts
+                                    max_persons_snapshot = _recording_max_persons
+                                    rec_fn_snapshot = recording_filename
+                                    rec_fn_raw_snapshot = recording_filename_raw
+                                    _stop_task = asyncio.create_task(
+                                        _finalize_and_notify(
+                                            websocket,
+                                            start_ts_snapshot,
+                                            max_persons_snapshot,
+                                            rec_fn_snapshot,
+                                            rec_fn_raw_snapshot,
+                                        )
+                                    )
                     except Exception as e:
                         # Do not break stream on detection errors
                         print(f"Auto record check error: {e}")
@@ -1065,7 +1136,28 @@ async def unified_video_ws(websocket: WebSocket):
                         processed_frame = raw_frame
                     else:
                         # 미검증 사용자: 모자이크 적용 (원본 사본에 적용)
-                        processed_frame = process_frame(raw_frame.copy(), mode="face_plate")
+                        st = stream_stats.get(websocket_id) or {}
+                        idx = int(st.get("frame_idx", 0))
+                        cached = st.get("last_mosaic")
+                        need_new = True
+                        if MOSAIC_EVERY_N > 1 and idx % MOSAIC_EVERY_N != 0 and cached is not None:
+                            need_new = False
+                        if need_new:
+                            try:
+                                h0, w0 = raw_frame.shape[:2]
+                                # 내부 처리 축소 후 원본 크기로 복원(프라이버시 보장 유지)
+                                if MOSAIC_PROCESS_MAX_WIDTH and MOSAIC_PROCESS_MAX_WIDTH > 0 and w0 > MOSAIC_PROCESS_MAX_WIDTH:
+                                    scale = MOSAIC_PROCESS_MAX_WIDTH / float(w0)
+                                    small = cv2.resize(raw_frame, (int(w0 * scale), int(h0 * scale)))
+                                    mosaic_small = await asyncio.to_thread(process_frame, small.copy(), mode="face_plate")
+                                    processed_frame = cv2.resize(mosaic_small, (w0, h0))
+                                else:
+                                    processed_frame = await asyncio.to_thread(process_frame, raw_frame.copy(), mode="face_plate")
+                                st["last_mosaic"] = processed_frame
+                            except Exception:
+                                processed_frame = raw_frame  # 실패 시 원본 유지(전송 전 단계에서 품질 저하로 완화)
+                        else:
+                            processed_frame = cached
 
                     # 전송 최적화: 리사이즈 + JPEG 품질 조정
                     display_frame = processed_frame
@@ -1080,8 +1172,11 @@ async def unified_video_ws(websocket: WebSocket):
                         display_frame = processed_frame
                     q = int(os.getenv("STREAM_JPEG_QUALITY", "70"))
                     q = max(1, min(100, q))
-                    _, jpg = cv2.imencode('.jpg', display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), q])
-                    jpg_bytes = jpg.tobytes()
+                    # JPEG 인코딩도 CPU 작업이므로 오프로딩
+                    def _encode_jpg(img, quality):
+                        ret, arr = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+                        return arr.tobytes() if ret else b''
+                    jpg_bytes = await asyncio.to_thread(_encode_jpg, display_frame, q)
                     
                     # 녹화 중이면 프레임 저장 (모자이크 및 원본 동시 저장)
                     with recording_lock:
@@ -1092,9 +1187,26 @@ async def unified_video_ws(websocket: WebSocket):
                             # 처리본(mosaic)은 이미 계산된 결과를 가능한 재사용
                             if video_writer is not None:
                                 try:
+                                    st = stream_stats.get(websocket_id) or {}
+                                    idx = int(st.get("frame_idx", 0))
                                     if user_status.get("is_verified", False):
-                                        # 화면은 원본이지만 저장은 모자이크 강제
-                                        rec_proc_frame = process_frame(raw_frame.copy(), mode="face_plate")
+                                        # 화면은 원본이지만 저장은 모자이크 강제(캐시/N프레임 샘플 재사용)
+                                        cached = st.get("last_mosaic")
+                                        need_new = True
+                                        if MOSAIC_EVERY_N > 1 and idx % MOSAIC_EVERY_N != 0 and cached is not None:
+                                            need_new = False
+                                        if need_new:
+                                            h0, w0 = raw_frame.shape[:2]
+                                            if MOSAIC_PROCESS_MAX_WIDTH and MOSAIC_PROCESS_MAX_WIDTH > 0 and w0 > MOSAIC_PROCESS_MAX_WIDTH:
+                                                scale = MOSAIC_PROCESS_MAX_WIDTH / float(w0)
+                                                small = cv2.resize(raw_frame, (int(w0 * scale), int(h0 * scale)))
+                                                mosaic_small = process_frame(small.copy(), mode="face_plate")
+                                                rec_proc_frame = cv2.resize(mosaic_small, (w0, h0))
+                                            else:
+                                                rec_proc_frame = process_frame(raw_frame.copy(), mode="face_plate")
+                                            st["last_mosaic"] = rec_proc_frame
+                                        else:
+                                            rec_proc_frame = cached
                                     else:
                                         rec_proc_frame = processed_frame
                                 except Exception:
