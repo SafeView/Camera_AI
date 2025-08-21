@@ -1,3 +1,21 @@
+# =====================================================================
+# Module: AI_processor
+# Purpose: 얼굴/머리/번호판 비식별(모자이크) 처리 및 다양한 검출 파이프라인 유틸리티 제공.
+# Responsibilities:
+#   - MediaPipe + Haar + Profile + HOG fallback 결합을 통한 얼굴/머리 영역 결정
+#   - 번호판(예시 Haar) 검출 및 모자이크 처리
+#   - 프레임별 샘플링/캐싱을 통한 성능 최적화 (_frame_counter, *_last_*)
+#   - 추적/영속 모자이크(head tracks) 유지로 깜빡임 감소
+# Design Notes:
+#   - 환경 변수 기반 튜닝(샘플 간격, 최소 픽셀, margin 등) -> 운영 중 동적 조정 용이
+#   - 2차 검증(Haar/Profile)로 잘못된 MediaPipe 결과 필터링
+#   - 성능 이슈 발생 시: (1) 해상도 축소 (2) 샘플 주기 증가 (3) Haar 검증 비활성화
+# Extension Tips:
+#   - GPU 가속 필요 시 MediaPipe 대신 ONNX/TensorRT 모델 교체
+#   - 추적 품질 향상을 위해 Kalman Filter / ByteTrack 등 통합 가능
+#   - 번호판 인식 후 민감정보 탐지 파이프라인 연계 가능
+# =====================================================================
+
 import os
 import cv2
 import numpy as np
@@ -447,4 +465,3 @@ def process_frame(frame, mode="face_plate"):
 def detect_and_blur_enhanced(frame, blur_face=True, blur_plate=True):
     # Keep function for compatibility, but route to optimized path
     return detect_and_blur(frame, blur_face=blur_face, blur_plate=blur_plate)
-
