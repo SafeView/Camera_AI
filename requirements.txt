@@ -1,0 +1,14 @@
+opencv-python
+numpy
+fastapi
+uvicorn
+boto3
+python-dotenv
+requests
+mysql-connector-python
+aiohttp
+websockets
+ultralytics
+scikit-learn
+python-multipart
+ultralytics>=8.0.0

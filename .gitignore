@@ -1,0 +1,95 @@
+# macOS
+.DS_Store
+
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+*.log
+
+# Virtual environments
+.venv/
+venv/
+venv*/
+venv312/
+venv312/**
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Tracking reports (JSON)
+tracking_report_*.json
+tracking_report_session_*.json
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.env
+
+# VSCode
+.vscode/
+
+# macOS
+.DS_Store
+
+# 기타
+*.log
+
+# YOLO 훈련 결과 및 모델 파일
+runs/
+*.pt
+*.onnx
+*.pth
+*.weights
+*.cfg
+
+# API 결과 및 업로드 파일
+api_results/
+uploads/
+stored_persons/
+
+# 데이터셋 파일
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.flv
+
+# 훈련 결과 이미지
+train_batch*.jpg
+val_batch*.jpg
+confusion_matrix*.png
+results*.png
+labels_correlogram.jpg
+results.csv
+
+# 로그 파일
+*.log
+logs/
+
+# 임시 파일
+temp/
+tmp/
+*.tmp
+
+# 환경 변수
+.env
+.env.local
+.env.production
+
+# AWS 자격 증명 (보안상 중요!)
+.aws/
+credentials

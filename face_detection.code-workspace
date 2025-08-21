@@ -1,0 +1,25 @@
+{
+	"folders": [
+		{
+			"name": "face_detection",
+			"path": "../face_detection_system/face_detection"
+		},
+		{
+			"name": "Python_AI",
+			"path": "."
+		},
+		{
+			"name": "Deteksi Wajah.v1i.yolov8",
+			"path": "../../Downloads/Deteksi Wajah.v1i.yolov8"
+		},
+		{
+			"name": "face_detection_dataset",
+			"path": "../face_detection_system/face_detection_dataset"
+		},
+		{
+			"name": "face_detection_system",
+			"path": "../face_detection_system"
+		}
+	],
+	"settings": {}
+}
