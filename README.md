@@ -1,117 +1,206 @@
-# SafeView FastAPI Server
+# SafeView AI Server
 
 실시간 영상 비식별화(얼굴 모자이크)와 자동 녹화/업로드를 제공하는 FastAPI 기반 서버입니다. WebSocket으로 영상을 받아 모자이크 처리 후 스트리밍하고, 조건에 따라 처리본/원본을 동시에 녹화합니다. 결과는 S3에 업로드되며 완료 시 Spring 서버에 콜백을 보냅니다. 오프라인 영상에 대해 특정 시간 구간의 얼굴을 추출하는 API도 포함됩니다.
 
-자세한 구조와 동작 흐름은 docs/ARCHITECTURE.md 참고.
+## 📋 목차
 
-## 주요 기능
-- WebSocket 실시간 입력 + 모자이크 스트리밍 (JPEG 전송, FPS 제한, 코얼레싱)
-- 옆모습 지속 모자이크: 머리 추적(IoU+TTL) + HOG 보조
-- 자동 녹화: 처리본/원본 이중 저장, presence 히트 & 부재 타임아웃 기반 시작/중단(또는 모자이크 기반 트리거)
-- S3 업로드 및 로컬 폴백, Spring 콜백으로 URL 전달
-- 시간 기반 얼굴 검출 API: 파일 업로드, blob/data URL, http(s), S3 지원
+- [프로젝트 개요](#프로젝트-개요)
+- [기술 스택](#기술-스택)
+- [프로젝트 구조](#프로젝트-구조)
+- [주요 기능](#주요-기능)
+- [API 문서](#api-문서)
+- [설치 및 실행](#설치-및-실행)
+- [환경 설정](#환경-설정)
+- [데이터베이스](#데이터베이스)
+- [개발 가이드](#개발-가이드)
+- [라이선스](#라이선스)
+- [기여하기](#기여하기)
 
-## 빠른 실행 요약
-```bash
-git clone https://github.com/SafeView/Python_AI.git
-cd Python_AI
-curl -LsSf https://astral.sh/uv/install.sh | sh  # 또는 brew install uv
-uv sync
-uv run uvicorn server.app:app --host 0.0.0.0 --port 8000
-# 또는
-uv run python http_video_server.py
-```
-> server.app:app 직접 실행 혹은 http_video_server.py 로 진입.
+## 🎯 프로젝트 개요
 
-## 기술 스택
+SafeView AI Server는 실시간 스트림으로 들어오는 프레임을 비식별화(얼굴/번호판 모자이크)한 뒤 스트리밍하고, 조건에 따라 자동으로 녹화하여 S3에 업로드합니다. 또한 오프라인 영상에서 특정 시간 구간의 얼굴을 추출하는 API를 제공합니다. Spring 백엔드와 연동해 키 검증과 메타 등록을 처리합니다.
+
+### 주요 특징
+
+- 🎥 실시간 비식별화 스트리밍: WebSocket으로 JPEG 프레임 수신 → 모자이크 → JPEG 송신
+- 🔴 자동 녹화: 인원 수/히스토리 기반 시작·종료, 처리본/원본 이중 저장
+- ☁️ S3 업로드: 업로드/목록/서명 URL 발급, 완료 시 Spring 콜백
+- 🧠 시간 구간 얼굴 추출: 파일/URL/S3/Blob 입력 지원, 중복 제거 후 결과 반환
+- 🔐 키 검증 연동: 백엔드 API + AiApiKey 헤더 기반 검증
+
+## 🛠️ 기술 스택
+
+### Backend
 - Python 3.10 ~ < 3.13
-- FastAPI / Uvicorn
-- OpenCV, MediaPipe, YOLO(ultralytics)
-- aiohttp, boto3
-- uv 패키지/실행 관리
+- FastAPI, Uvicorn
 
-## 사전 준비
-1. Python 버전 확인 (`python --version`)
-2. uv 설치 (없다면 위 요약 참조)
-3. (선택) `.venv/` 자동 생성 (uv sync 시)
+### Vision/Streaming
+- OpenCV, MediaPipe, Ultralytics YOLO
+- NumPy
 
-## 설치 (uv 권장)
+### Networking & Storage
+- aiohttp, requests
+- AWS S3(boto3)
+
+### Dev/Packaging
+- uv 또는 pip
+- Docker (python:3.11-slim, ffmpeg/libgl 포함)
+
+## 📁 프로젝트 구조
+
+```
+server/
+  app.py                # FastAPI 앱/미들웨어/메타 라우터
+  websocket_stream.py   # WS 수신, 모자이크, 자동녹화 트리거, 스트리밍
+  recording.py          # 녹화 시작/종료, 업로드, 목록, URL 발급
+  verification.py       # AiApiKey 기반 키 검증, 사용자 정보 수신
+  face_time_api.py      # 시간 기반 얼굴 추출 REST API
+  core/state.py         # 런타임 공유 상태
+  storage/s3.py         # S3 클라이언트/업로드/리스트/서명 URL
+AI_processor.py         # 프레임 비식별화 파이프라인
+http_video_server.py    # 실행 스크립트(uvicorn 진입)
+Dockerfile              # 컨테이너 빌드/실행 정의
+pyproject.toml          # uv 의존성(권장)
+requirements.txt        # pip 의존성
+```
+
+## 🚀 주요 기능
+
+### 1. 실시간 비식별화 스트리밍
+- WebSocket: `ws://{host}:{port}/ws/video`
+- JPEG 바이너리 프레임 수신 → 모자이크 처리 → JPEG 송신
+- FPS 제한, 코얼레싱으로 최신 프레임 우선 전송
+
+### 2. 자동 녹화/업로드
+- 시작: 인원 수 임계치 + presence 히트 충족 시
+- 종료: 부재 지속 시간(AUTO_ZERO_TIMEOUT_SEC) 초과 시
+- 처리본·원본 동시 저장 → S3 업로드(설정 시) → Spring 콜백
+
+### 3. 시간 구간 얼굴 추출
+- 입력: 업로드 파일, HTTP(S) URL, data:/blob:, S3(recordings/{filename})
+- YOLO(+Cascade 보정) 기반 탐지, 해시·위치로 중복 제거, 결과 저장/업로드
+
+### 4. 검증/접근 제어
+- AiApiKey + 백엔드 키 검증 결과에 따라 원본 저장 완화/강제 모자이크
+- 모든 연결에 모자이크 강제 적용 가능
+
+## 📚 API 문서
+
+### 메타/상태
+- `GET /health` - 서버 상태/리비전
+- `GET /last_detections` - 마지막 스트림 요약
+- `GET /auto_recording` - 자동 녹화 설정/상태
+- `POST /auto_recording` - {enabled, threshold} 런타임 변경
+- `POST /disconnect_ws` - 모든 WebSocket 연결 종료 통보
+
+### 스트림(WebSocket)
+- `WS /ws/video`
+  - Client → Server: JPEG 프레임 또는 제어 메시지
+    - `{ "type": "key_verification", "accessToken": "...", "cameraId": "..." }`
+    - `{ "type": "disconnect" }`
+  - Server → Client: 모자이크 JPEG, 이벤트(JSON)
+    - `auto_recording_started`, `auto_recording_will_finalize`, `auto_recording_finalized`, 오류 등
+
+### 녹화 제어/목록
+- `POST /start_recording` - 수동 시작(다음 프레임부터)
+- `POST /stop_recording` - 즉시 종료 및 업로드/경로 반환
+- `GET /recording_status` - 현재 상태
+- `GET /recordings` - S3 객체 목록
+- `GET /recordings/{filename}` - 서명 URL 발급
+
+### 검증/강제 모자이크
+- `POST /client/user` - `{userId}` 수신/저장(메타 전송용)
+- `GET /verification_status` - 검증 연결 수 요약
+- `POST /force_mosaic` - 전 연결 모자이크 강제 적용
+
+### 시간 기반 얼굴 검출(prefix: `/face-detection`)
+- `GET /face-detection` - 버전/상태
+- `POST /face-detection/upload-video` - 폼 업로드 → 로컬 저장
+- `POST /face-detection/detect-faces` - 구간 얼굴 추출
+  - Query: `time_input`(예: "90" 또는 "1 30"), `filename` | `video_url` | `from_s3` + `file`
+- `GET /face-detection/video-info/{filename}` - 로컬 업로드 비디오 메타
+- `GET /face-detection/results` - 결과 요약 목록
+- `GET /face-detection/results/{result_id}` - 결과 JSON
+- `GET /face-detection/download-face/{result_id}/{filename}` - 얼굴 이미지 다운로드
+
+## 🛠️ 설치 및 실행
+
+### 1. 프로젝트 클론
+```bash
+git clone [repository-url]
+cd Camera_AI
+```
+
+### 2. 의존성 설치
+- uv(권장)
 ```bash
 uv sync
 ```
-패키지 추가: `uv add 패키지명`
-
-### (대안) pip
+- pip(대안)
 ```bash
 python -m venv .venv
 source .venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## 실행
+### 3. 애플리케이션 실행
 ```bash
+# 방법 A
 uv run python http_video_server.py
-# 또는
-uv run uvicorn http_video_server:app --host 0.0.0.0 --port 8000
-```
-다중 워커 사용 시 전역 상태 공유 불가.
-
-## WebSocket 사용 흐름
-1. `ws://{host}:{port}/ws/video` 연결
-2. JPEG 프레임 전송
-3. 모자이크 처리 후 JPEG 수신
-4. 자동 녹화 이벤트 메시지 수신
-
-## 자동 녹화 요약
-| 조건 | 설명 |
-|------|------|
-| 시작 | `pcnt >= AUTO_RECORD_THRESHOLD` AND presence 히트 충족, 또는 얼굴 모자이크 발생(RECORD_BY_MOSAIC=1) |
-| 중단 | 연속 부재 시간 ≥ `AUTO_ZERO_TIMEOUT_SEC`, 또는 얼굴 모자이크 해제(RECORD_BY_MOSAIC=1) |
-| 메타 | 최대 인원 `_recording_max_persons` 기록 |
-
-## 주요 엔드포인트
-| 메소드 | 경로 | 설명 |
-|--------|------|------|
-| GET | /health | 헬스 체크 |
-| WS | /ws/video | 실시간 스트림 |
-| POST | /start_recording | 수동 녹화 요청 |
-| POST | /stop_recording | 녹화 중단 |
-| GET | /recording_status | 녹화 상태 |
-| GET | /recordings | 녹화 목록 |
-| POST | /face-detection/upload-video | 오프라인 업로드 |
-| POST | /face-detection/detect-faces | 특정 시점 얼굴 추출 |
-
-## 디렉토리 개요
-```
-server/
-  app.py
-  websocket_stream.py
-  recording.py
-  verification.py
-  face_time_api.py
-  core/state.py
-  analytics/person_count.py
-AI_processor.py
-http_video_server.py
-docs/ARCHITECTURE.md
+# 방법 B
+uv run uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
 
-## 개발 워크플로
+### 4. 개발 서버 접속
+- 앱: http://localhost:8000
+- 문서: http://localhost:8000/docs
+
+
+## 🗄️ 데이터베이스
+
+이 서비스는 별도 데이터베이스를 직접 사용하지 않습니다. 결과와 녹화본은 로컬 디렉토리 또는 S3에 저장됩니다.
+
+### 주요 경로/프리픽스
+- 로컬: `uploads/`, `api_results/`
+- S3: `recordings/`, `api_results/{result_id}/faces/`
+
+## 🔒 보안
+
+### 인증 및 권한
+- 🔑 키 검증: 백엔드 `/api/decryption/keys/verify/ai`와 AiApiKey 헤더로 검증
+- 🧱 강제 모자이크: 미검증 연결은 항상 모자이크 적용, 필요 시 전 연결 강제 전환
+- 🔐 CORS 허용 범위 설정, 프로덕션 HTTPS 권장
+
+### 데이터 보안
+- ☁️ 업로드: S3 서명 URL 발급으로 안전한 접근
+- 🧪 입력값 검증: 파일 형식/시간 파라미터 검증, 오류 응답 일관화
+
+## 👨‍💻 개발 가이드
+
+### 코드 컨벤션
+- 모듈화된 라우터(server/*) 유지, 공통 상태는 `server/core/state.py`
+- 설정은 `server/config.py`의 환경 변수로 제어
+- 예외는 사용자 친화적 메시지로 래핑(HTTPException/JSON)
+
+### 개발 워크플로
 ```bash
-uv add some-package
-uv run python -c "import requests;print(requests.get('http://localhost:8000/health').json())"
+uv add <package>
+uv run uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
 
-## 문제 해결
-| 증상 | 조치 |
-|------|------|
-| 자동 녹화 시작 안 됨 | 임계/히트 조정, DETECT_EVERY_N=1 테스트, RECORD_BY_MOSAIC=1 확인 |
-| VideoWriter 실패 | 코덱 지원 확인, MJPG 폴백 로그 확인 |
-| S3 업로드 실패 | 자격/권한 및 구성 점검 |
-| 사람 수 0 지속 | 조명/해상도/모델 설정 조정 |
+## 📝 라이선스
 
-## 라이선스
-(내부 정책에 따라 지정 예정)
+이 프로젝트는 MIT 라이선스 하에 배포됩니다.
+
+## 🤝 기여하기
+
+1. Fork the Project
+2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the Branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
 
 ---
-이슈나 개선 요청 환영.
+
+SafeView AI Server - 안전한 CCTV 영상 비식별화/녹화/분석을 위한 AI 백엔드
