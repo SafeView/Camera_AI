@@ -28,6 +28,20 @@ from .config import STREAM_MAX_WIDTH, STREAM_JPEG_QUALITY, SERVER_REV
 from fastapi import APIRouter, Body
 import time
 from datetime import datetime
+import os
+try:
+    import cv2
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+except Exception:
+    pass
+# 과도한 BLAS/OpenMP 스레드 제한
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
 
 app = FastAPI(title="SafeView FastAPI Server", version="refactor-1", description="Modularized server")
 
