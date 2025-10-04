@@ -55,6 +55,9 @@ _recording_max_persons: int = 0
 _recording_ws_id: Optional[int] = None
 _manual_start_requested: bool = False
 _stop_task = None  # asyncio.Task | None : 비동기 finalize 작업 핸들
+# 최근 녹화 시작/종료 시각 (쿨다운/최소 지속시간 판단용)
+_last_record_start_ts: Optional[float] = None
+_last_record_stop_ts: Optional[float] = None
 
 # --- Auto Recording Debug Structure ------------------------------------------
 _auto_debug = {
@@ -80,5 +83,6 @@ __all__ = [
     'active_websockets','stream_stats','last_stream_snapshot','verified_users','verification_lock',
     'is_recording','video_writer','video_writer_raw','recording_filename','recording_filename_raw','recording_lock','TEMP_DIR',
     '_recording_started_at_ts','_recording_max_persons','_recording_ws_id','_manual_start_requested','_stop_task',
-    '_auto_debug','_last_nonzero_person_ts','_zero_since_ts','last_user_info'
+    '_auto_debug','_last_nonzero_person_ts','_zero_since_ts','last_user_info',
+    '_last_record_start_ts','_last_record_stop_ts'
 ]

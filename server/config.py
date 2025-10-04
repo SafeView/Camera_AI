@@ -13,7 +13,6 @@
 # =====================================================================
 from __future__ import annotations
 import os
-from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -32,13 +31,18 @@ AUTO_ZERO_TIMEOUT_SEC = float(os.getenv("AUTO_ZERO_TIMEOUT_SEC", "3.0"))
 AUTO_RECORD_DEBUG = os.getenv("AUTO_RECORD_DEBUG", "1") in ("1","true","True")
 AUTO_RECORD_TEMP_DISABLED = os.getenv("AUTO_RECORD_TEMP_DISABLED", "0") in ("1","true","True")
 DETECT_EVERY_N = int(os.getenv("DETECT_EVERY_N", "2"))
-MOSAIC_EVERY_N = int(os.getenv("MOSAIC_EVERY_N", "1"))
-MOSAIC_PROCESS_MAX_WIDTH = int(os.getenv("MOSAIC_PROCESS_MAX_WIDTH", "0"))
+MOSAIC_EVERY_N = int(os.getenv("MOSAIC_EVERY_N", "2"))
+MOSAIC_PROCESS_MAX_WIDTH = int(os.getenv("MOSAIC_PROCESS_MAX_WIDTH", "640"))
 AUTO_PRESENCE_WINDOW = int(os.getenv("AUTO_PRESENCE_WINDOW", "20"))
 AUTO_PRESENCE_MIN_HITS = int(os.getenv("AUTO_PRESENCE_MIN_HITS", "5"))
+# 안정화 파라미터: 최소 녹화 지속시간과 중단 후 쿨다운(초)
+MIN_RECORD_DURATION_SEC = float(os.getenv("MIN_RECORD_DURATION_SEC", "5.0"))
+COOLDOWN_AFTER_STOP_SEC = float(os.getenv("COOLDOWN_AFTER_STOP_SEC", "5.0"))
 STREAM_MAX_WIDTH = int(os.getenv("STREAM_MAX_WIDTH", "960"))
-STREAM_JPEG_QUALITY = int(os.getenv("STREAM_JPEG_QUALITY", "70"))
-STREAM_TARGET_FPS = float(os.getenv("STREAM_TARGET_FPS", "15"))
+STREAM_JPEG_QUALITY = int(os.getenv("STREAM_JPEG_QUALITY", "65"))
+STREAM_TARGET_FPS = float(os.getenv("STREAM_TARGET_FPS", "12"))
+RECORD_SAVE_RAW = os.getenv("RECORD_SAVE_RAW", "0") in ("1","true","True")
+RECORD_BY_MOSAIC = os.getenv("RECORD_BY_MOSAIC", "1") in ("1","true","True")
 
 # Face detection(time based) thresholds
 FACE_DETECTION_CONFIDENCE_THRESHOLD = float(os.getenv('FACE_DETECTION_CONFIDENCE_THRESHOLD', '0.5'))
@@ -70,5 +74,6 @@ __all__ = [
     'AUTO_PRESENCE_WINDOW','AUTO_PRESENCE_MIN_HITS','STREAM_MAX_WIDTH','STREAM_JPEG_QUALITY','STREAM_TARGET_FPS',
     'FACE_DETECTION_CONFIDENCE_THRESHOLD','FACE_SIMILARITY_THRESHOLD','PROCESSING_DURATION_SECONDS',
     'S3_BUCKET_NAME','S3_REGION','AWS_ACCESS_KEY_ID','AWS_SECRET_ACCESS_KEY','USE_S3','SPRING_MAKE_ENTITY_URL',
-    'UPLOAD_DIR','API_RESULTS_DIR','HOST','PORT'
+    'UPLOAD_DIR','API_RESULTS_DIR','HOST','PORT','RECORD_SAVE_RAW','RECORD_BY_MOSAIC',
+    'MIN_RECORD_DURATION_SEC','COOLDOWN_AFTER_STOP_SEC'
 ]
