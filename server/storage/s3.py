@@ -1,9 +1,8 @@
 from __future__ import annotations
-import os
 import boto3
-from botocore.exceptions import ClientError
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, Dict, Any
 from ..config import S3_BUCKET_NAME, S3_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, USE_S3
+import os
 
 s3_client = None
 if USE_S3:
@@ -21,13 +20,40 @@ else:
     print("S3 환경변수가 설정되지 않음")
 
 
+def _guess_content_type(filename: str) -> str:
+    ext = os.path.splitext(filename)[1].lower()
+    return {
+        '.mp4': 'video/mp4',
+        '.m4v': 'video/x-m4v',
+        '.mov': 'video/quicktime',
+        '.avi': 'video/x-msvideo',
+        '.mkv': 'video/x-matroska',
+        '.webm': 'video/webm',
+    }.get(ext, 'application/octet-stream')
+
+
 def upload_recording(file_path: str, filename: str) -> Tuple[bool, str]:
     if not USE_S3 or not s3_client:
         return False, "S3 not configured"
     try:
-        s3_client.upload_file(file_path, S3_BUCKET_NAME, f"recordings/{filename}")
-        return True, f"https://{S3_BUCKET_NAME}.s3.{S3_REGION}.amazonaws.com/recordings/{filename}"
+        key = f"recordings/{filename}"
+        ct = _guess_content_type(filename)
+        print(f"[UPLOAD] 시작: bucket={S3_BUCKET_NAME} region={S3_REGION} key={key} path={file_path} contentType={ct}")
+        s3_client.upload_file(
+            file_path,
+            S3_BUCKET_NAME,
+            key,
+            ExtraArgs={
+                "ContentType" : ct,
+                "ContentDisposition": f'inline; filename="{filename}"'
+            }
+        )
+        url = f"https://{S3_BUCKET_NAME}.s3.{S3_REGION}.amazonaws.com/{key}"
+        print(f"[UPLOAD] 성공: {filename} -> {url}")
+        return True, url
+
     except Exception as e:
+        print(f"[UPLOAD] 실패: {filename} error={e}")
         return False, str(e)
 
 
@@ -39,7 +65,7 @@ def list_recordings() -> Dict[str, Any]:
         files = []
         for obj in response.get('Contents', []):
             key = obj['Key']
-            if not key.endswith('.mp4'):
+            if not (key.endswith('.mp4')):
                 continue
             filename = key.replace('recordings/', '')
             files.append({
@@ -73,4 +99,3 @@ def generate_presigned_url(filename: str):
         return {"error": f"S3 error: {e}"}
 
 __all__ = ['s3_client','upload_recording','list_recordings','generate_presigned_url']
-

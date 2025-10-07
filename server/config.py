@@ -62,6 +62,14 @@ SPRING_MAKE_ENTITY_URL = os.getenv("SPRING_MAKE_ENTITY_URL", "http://localhost:8
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 API_RESULTS_DIR = os.getenv("API_RESULTS_DIR", "api_results")
 
+# --- Transcode settings (for S3 upload) -------------------------------------
+# ffmpeg 바이너리 경로 및 H.264 인코딩 품질 설정
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
+H264_TRANSCODE_BEFORE_UPLOAD = os.getenv("H264_TRANSCODE_BEFORE_UPLOAD", "1") in ("1","true","True")
+H264_CRF = int(os.getenv("H264_CRF", "23"))            # 18(고품질)~28(저품질)
+H264_PRESET = os.getenv("H264_PRESET", "veryfast")      # ultrafast..placebo
+H264_PIXEL_FORMAT = os.getenv("H264_PIXEL_FORMAT", "yuv420p")
+
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(API_RESULTS_DIR, exist_ok=True)
 
@@ -75,5 +83,7 @@ __all__ = [
     'FACE_DETECTION_CONFIDENCE_THRESHOLD','FACE_SIMILARITY_THRESHOLD','PROCESSING_DURATION_SECONDS',
     'S3_BUCKET_NAME','S3_REGION','AWS_ACCESS_KEY_ID','AWS_SECRET_ACCESS_KEY','USE_S3','SPRING_MAKE_ENTITY_URL',
     'UPLOAD_DIR','API_RESULTS_DIR','HOST','PORT','RECORD_SAVE_RAW','RECORD_BY_MOSAIC',
-    'MIN_RECORD_DURATION_SEC','COOLDOWN_AFTER_STOP_SEC'
+    'MIN_RECORD_DURATION_SEC','COOLDOWN_AFTER_STOP_SEC',
+    # Transcode exports
+    'FFMPEG_BIN','H264_TRANSCODE_BEFORE_UPLOAD','H264_CRF','H264_PRESET','H264_PIXEL_FORMAT'
 ]
