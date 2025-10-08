@@ -41,7 +41,7 @@ COOLDOWN_AFTER_STOP_SEC = float(os.getenv("COOLDOWN_AFTER_STOP_SEC", "5.0"))
 STREAM_MAX_WIDTH = int(os.getenv("STREAM_MAX_WIDTH", "960"))
 STREAM_JPEG_QUALITY = int(os.getenv("STREAM_JPEG_QUALITY", "65"))
 STREAM_TARGET_FPS = float(os.getenv("STREAM_TARGET_FPS", "12"))
-RECORD_SAVE_RAW = os.getenv("RECORD_SAVE_RAW", "0") in ("1","true","True")
+RECORD_SAVE_RAW = os.getenv("RECORD_SAVE_RAW", "1") in ("1","true","True")
 RECORD_BY_MOSAIC = os.getenv("RECORD_BY_MOSAIC", "1") in ("1","true","True")
 
 # Face detection(time based) thresholds
@@ -66,9 +66,16 @@ API_RESULTS_DIR = os.getenv("API_RESULTS_DIR", "api_results")
 # ffmpeg 바이너리 경로 및 H.264 인코딩 품질 설정
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 H264_TRANSCODE_BEFORE_UPLOAD = os.getenv("H264_TRANSCODE_BEFORE_UPLOAD", "1") in ("1","true","True")
+# 대상별 트랜스코드 토글(기본: 처리본만 트랜스코드, 원본은 그대로 업로드)
+TRANSCODE_PROCESSED_BEFORE_UPLOAD = os.getenv("TRANSCODE_PROCESSED_BEFORE_UPLOAD", os.getenv("H264_TRANSCODE_BEFORE_UPLOAD", "1")) in ("1","true","True")
+TRANSCODE_RAW_BEFORE_UPLOAD = os.getenv("TRANSCODE_RAW_BEFORE_UPLOAD", "1") in ("1","true","True")
 H264_CRF = int(os.getenv("H264_CRF", "23"))            # 18(고품질)~28(저품질)
 H264_PRESET = os.getenv("H264_PRESET", "veryfast")      # ultrafast..placebo
 H264_PIXEL_FORMAT = os.getenv("H264_PIXEL_FORMAT", "yuv420p")
+# ffmpeg 내부 스레드 개수 제한(고성능 Mac에서 과부하 방지)
+H264_THREADS = int(os.getenv("H264_THREADS", "2"))      # 0은 ffmpeg 기본값(자동)
+# 업로드 동시성 제한(대용량 병렬 업로드로 인한 과부하 방지)
+UPLOAD_MAX_CONCURRENCY = int(os.getenv("UPLOAD_MAX_CONCURRENCY", "1"))
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(API_RESULTS_DIR, exist_ok=True)
@@ -85,5 +92,6 @@ __all__ = [
     'UPLOAD_DIR','API_RESULTS_DIR','HOST','PORT','RECORD_SAVE_RAW','RECORD_BY_MOSAIC',
     'MIN_RECORD_DURATION_SEC','COOLDOWN_AFTER_STOP_SEC',
     # Transcode exports
-    'FFMPEG_BIN','H264_TRANSCODE_BEFORE_UPLOAD','H264_CRF','H264_PRESET','H264_PIXEL_FORMAT'
+    'FFMPEG_BIN','H264_TRANSCODE_BEFORE_UPLOAD','TRANSCODE_PROCESSED_BEFORE_UPLOAD','TRANSCODE_RAW_BEFORE_UPLOAD',
+    'H264_CRF','H264_PRESET','H264_PIXEL_FORMAT','H264_THREADS','UPLOAD_MAX_CONCURRENCY'
 ]
