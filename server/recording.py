@@ -58,6 +58,7 @@ async def _transcode_to_h264_if_needed(input_path: str, original_filename: str) 
         '-pix_fmt', cfg.H264_PIXEL_FORMAT,
         '-c:a', 'aac',
         '-movflags', '+faststart',
+        '-threads', str(getattr(cfg, 'H264_THREADS', 2)),
         out_path
     ]
     t0 = time.time()
@@ -242,11 +243,22 @@ async def stop_and_finalize_recording() -> Dict[str, Any]:
     if cfg.USE_S3:
         # 트랜스코딩 + 업로드 파이프라인
         results_upload = []
-        # 1) 트랜스코딩 수행 (필요 시)
+        # 1) 트랜스코딩 수행 (파일별 정책)
         transcoded: List[Tuple[str, str, bool, str, str]] = []
         # tuple: (orig_fn, orig_path, ok, output_or_err, upload_filename)
         for fn, p in items:
-            if cfg.H264_TRANSCODE_BEFORE_UPLOAD:
+            is_raw = False
+            try:
+                stem = os.path.splitext(fn)[0]
+                is_raw = stem.endswith('_raw') or ('_raw_' in stem)
+            except Exception:
+                pass
+            do_transcode = False
+            if getattr(cfg, 'TRANSCODE_PROCESSED_BEFORE_UPLOAD', True) and not is_raw:
+                do_transcode = True
+            if getattr(cfg, 'TRANSCODE_RAW_BEFORE_UPLOAD', False) and is_raw:
+                do_transcode = True
+            if do_transcode:
                 ok, out_or_err, upload_fn = await _transcode_to_h264_if_needed(p, fn)
                 transcoded.append((fn, p, ok, out_or_err, upload_fn))
             else:
@@ -256,37 +268,39 @@ async def stop_and_finalize_recording() -> Dict[str, Any]:
             if ok:
                 print(f"[UPLOAD] S3 업로드 시작(H.264): key=recordings/{upload_fn} path={out_or_err}")
             else:
-                if cfg.H264_TRANSCODE_BEFORE_UPLOAD:
-                    print(f"[UPLOAD] 트랜스코딩 실패로 원본 업로드 시도: orig={orig_fn} err={out_or_err}")
+                if getattr(cfg, 'TRANSCODE_PROCESSED_BEFORE_UPLOAD', True) or getattr(cfg, 'TRANSCODE_RAW_BEFORE_UPLOAD', False):
+                    if orig_fn != upload_fn:
+                        print(f"[UPLOAD] 트랜스코딩 실패로 원본 업로드 시도: orig={orig_fn} err={out_or_err}")
                 print(f"[UPLOAD] S3 업로드 시작: key=recordings/{orig_fn} path={orig_path}")
-        # 3) 실제 업로드 (병렬)
+        # 3) 실제 업로드 (동시성 제한)
+        sem = asyncio.Semaphore(max(1, int(getattr(cfg, 'UPLOAD_MAX_CONCURRENCY', 1))))
         async def _upload_one(orig_fn, orig_path, ok, out_or_err, upload_fn):
-            if ok:
-                # 트랜스코딩 결과 업로드 (S3 파일명은 upload_fn)
-                s3_fn = upload_fn
-                up_path = out_or_err
-            else:
-                s3_fn = orig_fn
-                up_path = orig_path
-            success, res = await asyncio.to_thread(upload_recording, up_path, s3_fn)
-            # 성공 시 로컬 정리: 원본/트랜스코드 모두 제거 시도
-            if success:
-                for _p in {orig_path, out_or_err if ok else None}:
-                    try:
-                        if _p and os.path.exists(_p):
-                            os.remove(_p)
-                            print(f"[CLEANUP] 삭제됨: {_p}")
-                    except Exception as e:
-                        print(f"[CLEANUP] 삭제 실패: path={_p} err={e}")
-            else:
-                print(f"[CLEANUP] 업로드 실패로 파일 보존: orig={orig_path} trans={out_or_err if ok else 'N/A'}")
-            return {
-                'original_filename': orig_fn,
-                'uploaded_filename': s3_fn,
-                'path_used': up_path,
-                'ok': success,
-                'result': res
-            }
+            async with sem:
+                if ok:
+                    s3_fn = upload_fn
+                    up_path = out_or_err
+                else:
+                    s3_fn = orig_fn
+                    up_path = orig_path
+                success, res = await asyncio.to_thread(upload_recording, up_path, s3_fn)
+                # 성공 시 로컬 정리: 원본/트랜스코드 모두 제거 시도
+                if success:
+                    for _p in {orig_path, out_or_err if ok else None}:
+                        try:
+                            if _p and os.path.exists(_p):
+                                os.remove(_p)
+                                print(f"[CLEANUP] 삭제됨: {_p}")
+                        except Exception as e:
+                            print(f"[CLEANUP] 삭제 실패: path={_p} err={e}")
+                else:
+                    print(f"[CLEANUP] 업로드 실패로 파일 보존: orig={orig_path} trans={out_or_err if ok else 'N/A'}")
+                return {
+                    'original_filename': orig_fn,
+                    'uploaded_filename': s3_fn,
+                    'path_used': up_path,
+                    'ok': success,
+                    'result': res
+                }
         results_upload = await asyncio.gather(*[
             _upload_one(orig_fn, orig_path, ok, out_or_err, upload_fn)
             for (orig_fn, orig_path, ok, out_or_err, upload_fn) in transcoded
