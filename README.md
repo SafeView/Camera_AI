@@ -1,4 +1,6 @@
 # SafeView FastAPI Server
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FSafeView%2FCamera_AI.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FSafeView%2FCamera_AI?ref=badge_shield)
+
 
 실시간 영상 비식별화(얼굴/번호판 모자이크)와 자동 녹화/업로드를 제공하는 FastAPI 기반 서버입니다. WebSocket으로 영상을 받아 모자이크 처리 후 스트리밍하고, 조건에 따라 처리본/원본을 동시에 녹화합니다. 결과는 S3에 업로드되며 완료 시 Spring 서버에 콜백을 보냅니다. 오프라인 영상에 대해 특정 시간 구간의 얼굴을 추출하는 API도 포함됩니다.
 
@@ -115,3 +117,7 @@ uv run python -c "import requests;print(requests.get('http://localhost:8000/heal
 
 ---
 이슈나 개선 요청 환영.
+
+
+## License
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FSafeView%2FCamera_AI.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2FSafeView%2FCamera_AI?ref=badge_large)
