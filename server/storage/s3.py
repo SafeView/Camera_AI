@@ -45,7 +45,7 @@ def upload_recording(file_path: str, filename: str) -> Tuple[bool, str]:
             key,
             ExtraArgs={
                 "ContentType" : ct,
-                "ContentDisposition": f'inline; filename="{filename}"'
+                "ContentDisposition": f'attachment; filename="{filename}"'
             }
         )
         url = f"https://{S3_BUCKET_NAME}.s3.{S3_REGION}.amazonaws.com/{key}"
