@@ -31,7 +31,7 @@ from .config import (
 from .config import MIN_RECORD_DURATION_SEC
 import server.config as cfg  # 런타임 설정 동적 참조
 from .analytics.person_count import estimate_person_count
-from .recording import auto_start_recording_from_frame, finalize_and_notify
+from .recording import auto_start_recording_from_frame, finalize_and_notify, stop_and_finalize_recording
 from AI_processor import process_frame, process_frame_with_meta
 
 router = APIRouter()
@@ -422,6 +422,21 @@ async def unified_video_ws(websocket: WebSocket):
     finally:
         # 연결 종료/정리
         try:
+            # 이 세션이 녹화 주체였다면 대기 작업 취소 및 즉시 정리
+            try:
+                if state._recording_ws_id == ws_id:
+                    try:
+                        if state._stop_task is not None and not state._stop_task.done():
+                            state._stop_task.cancel()
+                    except Exception:
+                        pass
+                    if state.is_recording:
+                        try:
+                            await stop_and_finalize_recording()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             with state.verification_lock:
                 state.verified_users.pop(ws_id, None)
             st = state.stream_stats.get(ws_id, {})
