@@ -1,10 +1,3 @@
-opencv-python==4.8.1.78
-numpy==1.24.3
-fastapi==0.104.1
-uvicorn==0.24.0
-ultralytics==8.0.196
-scikit-learn==1.3.0
-python-multipart==0.0.6
-requests==2.31.0
-Pillow==10.0.1
-matplotlib==3.7.2
+-r ../requirements.txt
+
+# 모듈 전용 추가 패키지는 아래에만 기입 (가능하면 constraints에서 버전 핀)
