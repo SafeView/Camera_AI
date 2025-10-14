@@ -22,6 +22,37 @@ face_bboxes: List[List[int]] = []
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(API_RESULTS_DIR, exist_ok=True)
 
+# --- 안전한 파일명 유틸 (길이/문자 제한) --------------------------------------
+import re
+
+def _safe_filename(original: str | None, *, prefix: str = "", default_ext: str = "", max_len: int = 120) -> str:
+    """원본 파일명을 기반으로 안전하고 짧은 파일명을 생성.
+    - 허용 문자만 남기고 불허 문자는 '_'로 치환
+    - 확장자 유지(없으면 default_ext 사용)
+    - prefix 포함 전체 길이를 max_len 이하로 절단
+    """
+    name = (original or "").strip()
+    name = os.path.basename(name)
+    stem, ext = os.path.splitext(name)
+    if not ext and default_ext:
+        ext = default_ext if default_ext.startswith(".") else f".{default_ext}"
+    # 확장자 최대 10자, 허용 문자만
+    ext = re.sub(r"[^A-Za-z0-9\.]+", "", ext)[:10]
+    # 스템 정규화
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-") or "file"
+    # 전체 길이 제한
+    budget = max_len - len(prefix) - len(ext)
+    if budget < 8:  # 너무 작은 경우 최소 확보
+        budget = 8
+    if len(stem) > budget:
+        # 앞부분 대부분 + 끝쪽 일부 유지
+        keep_head = max(4, int(budget * 0.75))
+        keep_tail = budget - keep_head
+        stem = f"{stem[:keep_head]}_{stem[-keep_tail:] if keep_tail>0 else ''}".rstrip("_")
+    return f"{prefix}{stem}{ext}"
+
+# --------------------------------------------------------------------------
+
 def initialize_face_detector():  # pragma: no cover (heavy)
     global face_detector
     if face_detector is None:
@@ -264,11 +295,12 @@ async def upload_video(file: UploadFile = File(...)):
     if not validate_video_file(file.filename):
         raise HTTPException(status_code=400, detail='지원하지 않는 비디오 형식')
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f"{ts}_{file.filename}"
-    path = os.path.join(UPLOAD_DIR, filename)
+    # 원본 이름이 길어도 안전하게 축약
+    safe_name = _safe_filename(file.filename, prefix=f"{ts}_", default_ext=".mp4", max_len=120)
+    path = os.path.join(UPLOAD_DIR, safe_name)
     with open(path, 'wb') as bf:
         shutil.copyfileobj(file.file, bf)
-    return {"message": "비디오 업로드 성공", "filename": filename, "file_path": path}
+    return {"message": "비디오 업로드 성공", "filename": safe_name, "file_path": path}
 
 @router.post('/detect-faces')
 async def detect_faces(
@@ -293,14 +325,19 @@ async def detect_faces(
         if video_url.startswith('blob:'):
             if file is None:
                 raise HTTPException(status_code=400, detail='blob: URL은 직접 업로드 필요')
-            temp_path = os.path.join(tempfile.gettempdir(), f"upload_{int(time.time())}_{file.filename or 'video'}.mp4")
+            tmpdir = tempfile.gettempdir()
+            ts = int(time.time())
+            # 업로드된 파일 원본명을 안전하게 축약하여 임시 파일명 생성
+            safe_tmp = _safe_filename(getattr(file, 'filename', None) or 'video', prefix=f"upload_{ts}_", default_ext=".mp4", max_len=120)
+            temp_path = os.path.join(tmpdir, safe_tmp)
             with open(temp_path,'wb') as bf: shutil.copyfileobj(file.file, bf)
             file_path=temp_path; temp_created=True
         elif video_url.startswith('data:'):
             try:
                 header,b64 = video_url.split(',',1)
                 raw = base64.b64decode(b64)
-                temp_path = os.path.join(tempfile.gettempdir(), f"dataurl_{int(time.time())}.mp4")
+                tmpdir = tempfile.gettempdir()
+                temp_path = os.path.join(tmpdir, f"dataurl_{int(time.time())}.mp4")
                 with open(temp_path,'wb') as ftmp: ftmp.write(raw)
                 file_path=temp_path; temp_created=True
             except Exception as de:
@@ -322,14 +359,19 @@ async def detect_faces(
             raise HTTPException(status_code=400, detail='S3 미설정')
         try:
             s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=f'recordings/{filename}')
-            temp_file = os.path.join(tempfile.gettempdir(), f"temp_{filename}")
+            tmpdir = tempfile.gettempdir()
+            safe_tmp = _safe_filename(filename or 'video', prefix="temp_", default_ext=".mp4", max_len=120)
+            temp_file = os.path.join(tmpdir, safe_tmp)
             s3_client.download_file(S3_BUCKET_NAME, f'recordings/{filename}', temp_file)
             file_path=temp_file
         except Exception:
             raise HTTPException(status_code=404, detail='S3에서 파일 없음')
     else:
         if file is not None:
-            temp_path = os.path.join(tempfile.gettempdir(), f"upload_{int(time.time())}_{file.filename or 'video'}.mp4")
+            tmpdir = tempfile.gettempdir()
+            ts = int(time.time())
+            safe_tmp = _safe_filename(getattr(file, 'filename', None) or 'video', prefix=f"upload_{ts}_", default_ext=".mp4", max_len=120)
+            temp_path = os.path.join(tmpdir, safe_tmp)
             with open(temp_path,'wb') as bf: shutil.copyfileobj(file.file, bf)
             file_path=temp_path; temp_created=True
         elif not filename:
@@ -393,4 +435,3 @@ async def list_results():
     return {"results": out}
 
 __all__ = ['router']
-
