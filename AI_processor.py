@@ -1,9 +1,8 @@
 # =====================================================================
 # Module: AI_processor
-# Purpose: 얼굴/머리/번호판 비식별(모자이크) 처리 및 다양한 검출 파이프라인 유틸리티 제공.
+# Purpose: 얼굴/머리 비식별(모자이크) 처리 및 다양한 검출 파이프라인 유틸리티 제공.
 # Responsibilities:
 #   - MediaPipe + Haar + Profile + HOG fallback 결합을 통한 얼굴/머리 영역 결정
-#   - 번호판(예시 Haar) 검출 및 모자이크 처리
 #   - 프레임별 샘플링/캐싱을 통한 성능 최적화 (_frame_counter, *_last_*)
 #   - 추적/영속 모자이크(head tracks) 유지로 깜빡임 감소
 # Design Notes:
@@ -20,6 +19,7 @@ import os
 import cv2
 import numpy as np
 import mediapipe as mp
+import threading
 
 # 얼굴 탐지 모델
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
@@ -28,17 +28,15 @@ try:
     profile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
 except Exception:
     profile_cascade = cv2.CascadeClassifier()
-# 번호판 탐지 모델 (예시: haarcascade_russian_plate_number.xml)
-plate_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_russian_plate_number.xml")
 
 mp_face_detection = mp.solutions.face_detection
 # 신뢰도 임계값을 0.7로 상향 조정 (더 엄격한 얼굴 검출)
 face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.7)
+_mp_face_lock = threading.Lock()
 
 # --- Performance tuning (env-configurable) ---
 AI_DETECT_MAX_WIDTH = int(os.getenv("AI_DETECT_MAX_WIDTH", "640"))   # downscale width for detection; 0 to disable
 AI_FACE_SAMPLE_N = int(os.getenv("AI_FACE_SAMPLE_N", "3"))           # run face detection every N frames
-AI_PLATE_SAMPLE_N = int(os.getenv("AI_PLATE_SAMPLE_N", "3"))         # run plate detection every N frames
 # 기본값을 활성화로 변경하여 잘못된 검출을 줄임
 AI_FACE_HAAR_VALIDATE = os.getenv("AI_FACE_HAAR_VALIDATE", "1") in ("1", "true", "True")
 AI_PIXELATE_SCALE = int(os.getenv("AI_PIXELATE_SCALE", "12"))        # larger -> bigger blocks
@@ -55,13 +53,26 @@ AI_HEAD_STICKY_FRAMES = int(os.getenv("AI_HEAD_STICKY_FRAMES", "30"))  # persist
 AI_HEAD_IOU_MATCH = float(os.getenv("AI_HEAD_IOU_MATCH", "0.2"))       # IoU to associate detections to tracks
 AI_HEAD_EXPAND_TOP_RATIO = float(os.getenv("AI_HEAD_EXPAND_TOP_RATIO", "0.25"))  # expand upward to include hair
 AI_HEAD_EXPAND_X_RATIO = float(os.getenv("AI_HEAD_EXPAND_X_RATIO", "0.1"))   # expand left/right for side faces
+# 광학 흐름 기반 경량 추적 옵션
+AI_FLOW_ENABLED = os.getenv("AI_FLOW_ENABLED", "1") in ("1", "true", "True")
+AI_FLOW_PROCESS_MAX_WIDTH = int(os.getenv("AI_FLOW_PROCESS_MAX_WIDTH", "480"))  # 흐름 계산용 축소 폭
+AI_FLOW_FB_PYR_SCALE = float(os.getenv("AI_FLOW_FB_PYR_SCALE", "0.5"))
+AI_FLOW_FB_LEVELS = int(os.getenv("AI_FLOW_FB_LEVELS", "3"))
+AI_FLOW_FB_WINSIZE = int(os.getenv("AI_FLOW_FB_WINSIZE", "15"))
+AI_FLOW_FB_ITERS = int(os.getenv("AI_FLOW_FB_ITERS", "3"))
+AI_FLOW_FB_POLY_N = int(os.getenv("AI_FLOW_FB_POLY_N", "5"))
+AI_FLOW_FB_POLY_SIGMA = float(os.getenv("AI_FLOW_FB_POLY_SIGMA", "1.2"))
+AI_FLOW_BOX_SAMPLE_STEP = int(os.getenv("AI_FLOW_BOX_SAMPLE_STEP", "8"))  # ROI 내 샘플 간격(px, 축소 공간)
 
 # Simple frame counter and cached boxes
 _frame_counter = 0
 _last_faces = []  # list of (x1,y1,x2,y2)
-_last_plates = []  # list of (x,y,w,h)
 _hog = None  # lazy init for person fallback
 _head_tracks = []  # list of {"box":(x1,y1,x2,y2), "ttl":int}
+# 흐름 상태 (축소 그레이 프레임 캐시)
+_prev_gray_small = None
+_prev_gray_small_shape = None
+_prev_flow_scale = 1.0
 
 def _iou_xyxy(a, b):
     ax1, ay1, ax2, ay2 = a
@@ -77,12 +88,15 @@ def _iou_xyxy(a, b):
     union = area_a + area_b - inter
     return float(inter) / float(union) if union > 0 else 0.0
 
-def _update_head_tracks(detected_boxes):
-    """Update head tracks with new detections; maintain sticky TTL for persistence."""
+def _update_head_tracks(detected_boxes, decay: int = 1):
+    """Update head tracks with new detections; maintain sticky TTL for persistence.
+    decay: 프레임당 TTL 감소량. 탐지 수행 프레임에서는 1, 비탐지 프레임에서는 0으로 주어 트랙이 쉽게 사라지지 않게 한다.
+    """
     global _head_tracks
-    # Decrement existing TTL
-    for tr in _head_tracks:
-        tr["ttl"] -= 1
+    # Decrement existing TTL (조건부)
+    if decay > 0:
+        for tr in _head_tracks:
+            tr["ttl"] -= decay
     # Associate detections to existing tracks via IoU
     assigned = set()
     for i, box in enumerate(detected_boxes):
@@ -192,8 +206,89 @@ def _verify_face_roi(roi_bgr: np.ndarray) -> bool:
         return False
     return False
 
-def detect_and_blur(frame, blur_face=True, blur_plate=True):
-    global _frame_counter, _last_faces, _last_plates
+def _compute_small_gray(frame):
+    """프레임을 광학 흐름 계산용으로 축소하고 그레이스케일 반환."""
+    h, w = frame.shape[:2]
+    if AI_FLOW_PROCESS_MAX_WIDTH and w > AI_FLOW_PROCESS_MAX_WIDTH:
+        scale = AI_FLOW_PROCESS_MAX_WIDTH / float(w)
+        small = cv2.resize(frame, (int(w * scale), int(h * scale)))
+    else:
+        scale = 1.0
+        small = frame
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    return gray, scale
+
+def _flow_update_tracks(curr_gray_small, scale_small):
+    """Farneback 광학 흐름으로 기존 트랙 박스를 미세 이동시켜 유지.
+    ROI 내 평균 이동 벡터를 구해 박스를 이동한다. 유효 이동이면 TTL을 소폭 회복시켜 깜빡임을 줄인다.
+    """
+    global _prev_gray_small, _prev_flow_scale, _head_tracks
+    if _prev_gray_small is None or _prev_gray_small.shape != curr_gray_small.shape:
+        _prev_gray_small = curr_gray_small.copy()
+        _prev_flow_scale = scale_small
+        return
+    try:
+        flow = cv2.calcOpticalFlowFarneback(
+            _prev_gray_small, curr_gray_small,
+            None,
+            pyr_scale=AI_FLOW_FB_PYR_SCALE,
+            levels=AI_FLOW_FB_LEVELS,
+            winsize=AI_FLOW_FB_WINSIZE,
+            iterations=AI_FLOW_FB_ITERS,
+            poly_n=AI_FLOW_FB_POLY_N,
+            poly_sigma=AI_FLOW_FB_POLY_SIGMA,
+            flags=0
+        )  # shape: (H,W,2)
+        H, W = flow.shape[:2]
+        moved = False
+        for tr in _head_tracks:
+            x1, y1, x2, y2 = tr["box"]
+            # 현재 축소 스케일 기준 좌표로 변환 (이전 프레임과 스케일 동일 가정)
+            sx1 = int(x1 * scale_small)
+            sy1 = int(y1 * scale_small)
+            sx2 = int(x2 * scale_small)
+            sy2 = int(y2 * scale_small)
+            # 유효 ROI 검사
+            sx1 = max(0, min(W - 1, sx1)); sy1 = max(0, min(H - 1, sy1))
+            sx2 = max(0, min(W, sx2)); sy2 = max(0, min(H, sy2))
+            if sx2 - sx1 < 4 or sy2 - sy1 < 4:
+                continue
+            # 샘플 간격으로 그리드 포인트 선택 후 평균 이동
+            step = max(2, AI_FLOW_BOX_SAMPLE_STEP)
+            region = flow[sy1:sy2:step, sx1:sx2:step]
+            if region.size == 0:
+                continue
+            dx = float(np.mean(region[..., 0]))
+            dy = float(np.mean(region[..., 1]))
+            # 너무 큰 점프는 노이즈로 간주하고 무시
+            max_jump = 0.1 * max(W, H)
+            if abs(dx) > max_jump or abs(dy) > max_jump:
+                continue
+            # 원본 좌표계로 환산하여 이동 적용
+            if scale_small > 0:
+                mx = int(round(dx / scale_small))
+                my = int(round(dy / scale_small))
+            else:
+                mx = int(round(dx))
+                my = int(round(dy))
+            nx1 = max(0, min(curr_gray_small.shape[1] if scale_small==1.0 else int(W/scale_small), x1 + mx))
+            ny1 = max(0, min(curr_gray_small.shape[0] if scale_small==1.0 else int(H/scale_small), y1 + my))
+            nx2 = max(nx1 + 1, min(curr_gray_small.shape[1] if scale_small==1.0 else int(W/scale_small), x2 + mx))
+            ny2 = max(ny1 + 1, min(curr_gray_small.shape[0] if scale_small==1.0 else int(H/scale_small), y2 + my))
+            tr["box"] = (nx1, ny1, nx2, ny2)
+            # 유효 이동으로 판단되면 TTL을 소폭 회복 (최대치 제한)
+            tr["ttl"] = min(AI_HEAD_STICKY_FRAMES, tr["ttl"] + 1)
+            moved = True
+        # 상태 업데이트
+        _prev_gray_small = curr_gray_small.copy()
+        _prev_flow_scale = scale_small
+    except Exception:
+        _prev_gray_small = curr_gray_small.copy()
+        _prev_flow_scale = scale_small
+        return
+
+def detect_and_blur(frame, blur_face=True):
+    global _frame_counter, _last_faces
     _frame_counter += 1
     h, w = frame.shape[:2]
     # Downscale for detection
@@ -202,7 +297,10 @@ def detect_and_blur(frame, blur_face=True, blur_plate=True):
     if AI_DETECT_MAX_WIDTH and AI_DETECT_MAX_WIDTH > 0 and w > AI_DETECT_MAX_WIDTH:
         scale_det = AI_DETECT_MAX_WIDTH / float(w)
         det_frame = cv2.resize(frame, (int(w * scale_det), int(h * scale_det)))
-    det_gray = cv2.cvtColor(det_frame, cv2.COLOR_BGR2GRAY)
+    # Flow prep (경량 추적용)
+    flow_gray_small, flow_scale = (None, 1.0)
+    if AI_FLOW_ENABLED:
+        flow_gray_small, flow_scale = _compute_small_gray(frame)
 
     # Face/head detection sampling
     do_face = blur_face and ((_frame_counter % max(1, AI_FACE_SAMPLE_N)) == 0)
@@ -210,7 +308,8 @@ def detect_and_blur(frame, blur_face=True, blur_plate=True):
     detected_boxes = []  # fresh detections this cycle
     if blur_face:
         if do_face:
-            results = face_detection.process(cv2.cvtColor(det_frame, cv2.COLOR_BGR2RGB))
+            with _mp_face_lock:
+                results = face_detection.process(cv2.cvtColor(det_frame, cv2.COLOR_BGR2RGB))
             new_faces = []
             if results.detections:
                 dh, dw = det_frame.shape[:2]
@@ -266,7 +365,8 @@ def detect_and_blur(frame, blur_face=True, blur_plate=True):
                 _last_faces = new_faces
             # If nothing found and allowed, try full-res second pass
             if not _last_faces and AI_FACE_DETECT_AT_FULLRES_WHEN_EMPTY and scale_det != 1.0:
-                results_full = face_detection.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                with _mp_face_lock:
+                    results_full = face_detection.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 new_faces2 = []
                 if results_full.detections:
                     for detection in results_full.detections:
@@ -311,7 +411,7 @@ def detect_and_blur(frame, blur_face=True, blur_plate=True):
                     new_faces3.append((x1, y1, x2, y2))
                 if new_faces3:
                     _last_faces = new_faces3
-        # If still nothing, HOG person fallback (mosaic head region)
+        # HOG person fallback (mosaic head region)
         if not _last_faces and AI_USE_HOG_PERSON_FALLBACK:
             global _hog
             if _hog is None:
@@ -331,36 +431,12 @@ def detect_and_blur(frame, blur_face=True, blur_plate=True):
                 _last_faces = head_boxes
         # collect detections (if any) and update sticky tracks
         detected_boxes = list(_last_faces) if do_face else []
-        _update_head_tracks(detected_boxes)
+        _update_head_tracks(detected_boxes, decay=(1 if do_face else 0))
+        # 광학 흐름으로 트랙 유지/추적
+        if AI_FLOW_ENABLED and flow_gray_small is not None:
+            _flow_update_tracks(flow_gray_small, flow_scale)
         faces_to_use = [tr["box"] for tr in _head_tracks]
         faces_to_use = _nms_boxes(faces_to_use, thr=0.5)
-
-    # Plate detection sampling
-    do_plate = blur_plate and ((_frame_counter % max(1, AI_PLATE_SAMPLE_N)) == 0)
-    plates_to_use = []
-    if blur_plate:
-        if do_plate:
-            plates_det = plate_cascade.detectMultiScale(det_gray, scaleFactor=1.1, minNeighbors=3, minSize=(60, 20))
-            new_plates = []
-            for (dx, dy, dw, dh) in plates_det:
-                # scale back to original
-                if scale_det != 1.0:
-                    x = int(dx / scale_det)
-                    y = int(dy / scale_det)
-                    ww = int(dw / scale_det)
-                    hh = int(dh / scale_det)
-                else:
-                    x, y, ww, hh = dx, dy, dw, dh
-                # expand margin
-                mx = int(ww * AI_BOX_MARGIN)
-                my = int(hh * AI_BOX_MARGIN)
-                x1 = max(0, x - mx)
-                y1 = max(0, y - my)
-                x2 = min(w, x + ww + mx)
-                y2 = min(h, y + hh + my)
-                new_plates.append((x1, y1, x2 - x1, y2 - y1))
-            _last_plates = new_plates
-        plates_to_use = _last_plates
 
     # Apply mosaic
     if faces_to_use:
@@ -377,12 +453,6 @@ def detect_and_blur(frame, blur_face=True, blur_plate=True):
             roi = frame[y1e:y2, x1e:x2e]
             if roi.size > 0:
                 frame[y1e:y2, x1e:x2e] = fast_pixelate(roi.copy(), scale=AI_PIXELATE_SCALE)
-    if plates_to_use:
-        for (x, y, ww, hh) in plates_to_use:
-            x2, y2 = x + ww, y + hh
-            roi = frame[y:y2, x:x2]
-            if roi.size > 0:
-                frame[y:y2, x:x2] = fast_pixelate(roi.copy(), scale=AI_PIXELATE_SCALE)
     return frame
 
 def enhanced_face_detection(frame):
@@ -391,7 +461,8 @@ def enhanced_face_detection(frame):
     h, w, _ = frame.shape
     
     # 1. MediaPipe 얼굴 검출
-    results = face_detection.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    with _mp_face_lock:
+        results = face_detection.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     if results.detections:
         for detection in results.detections:
             bbox = detection.location_data.relative_bounding_box
@@ -452,16 +523,154 @@ def enhanced_face_detection(frame):
     return validated_faces
 
 # 다양한 모자이크 옵션을 위한 함수 예시
-def process_frame(frame, mode="face_plate"):
-    if mode == "face":
-        return detect_and_blur(frame, blur_face=True, blur_plate=False)
-    elif mode == "plate":
-        return detect_and_blur(frame, blur_face=False, blur_plate=True)
-    elif mode == "face_plate":
-        return detect_and_blur(frame, blur_face=True, blur_plate=True)
-    else:
-        return frame
+def process_frame(frame, mode="face"):
+    # plate 모드는 제거됨. 어떤 모드든 얼굴 모자이크만 수행.
+    return detect_and_blur(frame, blur_face=True)
 
-def detect_and_blur_enhanced(frame, blur_face=True, blur_plate=True):
-    # Keep function for compatibility, but route to optimized path
-    return detect_and_blur(frame, blur_face=blur_face, blur_plate=blur_plate)
+def detect_and_blur_meta(frame, blur_face=True):
+    """detect_and_blur의 메타 반환 버전. (processed_frame, {faces, faces_fresh})를 반환한다."""
+    global _frame_counter, _last_faces
+    _frame_counter += 1
+    h, w = frame.shape[:2]
+    det_frame = frame
+    scale_det = 1.0
+    if AI_DETECT_MAX_WIDTH and AI_DETECT_MAX_WIDTH > 0 and w > AI_DETECT_MAX_WIDTH:
+        scale_det = AI_DETECT_MAX_WIDTH / float(w)
+        det_frame = cv2.resize(frame, (int(w * scale_det), int(h * scale_det)))
+    flow_gray_small, flow_scale = (None, 1.0)
+    if AI_FLOW_ENABLED:
+        flow_gray_small, flow_scale = _compute_small_gray(frame)
+
+    do_face = blur_face and ((_frame_counter % max(1, AI_FACE_SAMPLE_N)) == 0)
+    faces_to_use = []
+    detected_boxes = []
+    if blur_face:
+        if do_face:
+            with _mp_face_lock:
+                results = face_detection.process(cv2.cvtColor(det_frame, cv2.COLOR_BGR2RGB))
+            new_faces = []
+            if results.detections:
+                dh, dw = det_frame.shape[:2]
+                for detection in results.detections:
+                    bbox = detection.location_data.relative_bounding_box
+                    if not is_valid_face_detection(bbox, dw, dh):
+                        continue
+                    if hasattr(detection, 'score') and len(detection.score) > 0:
+                        confidence = detection.score[0]
+                        if confidence < AI_FACE_CONF:
+                            continue
+                    x1 = max(0, int(bbox.xmin * dw)); y1 = max(0, int(bbox.ymin * dh))
+                    x2 = min(dw, int((bbox.xmin + bbox.width) * dw)); y2 = min(dh, int((bbox.ymin + bbox.height) * dh))
+                    # ROI Haar/Profile 검증 (잘못된 검출 제거)
+                    if AI_FACE_HAAR_VALIDATE:
+                        roi = det_frame[y1:y2, x1:x2]
+                        if roi.size == 0 or not _verify_face_roi(roi):
+                            continue
+                    # scale back to original
+                    if scale_det != 1.0:
+                        x1 = int(x1 / scale_det); y1 = int(y1 / scale_det)
+                        x2 = int(x2 / scale_det); y2 = int(y2 / scale_det)
+                    # expand margin
+                    mx = int((x2 - x1) * AI_BOX_MARGIN); my = int((y2 - y1) * AI_BOX_MARGIN)
+                    x1 = max(0, x1 - mx); y1 = max(0, y1 - my)
+                    x2 = min(w, x2 + mx); y2 = min(h, y2 + my)
+                    new_faces.append((x1, y1, x2, y2))
+            # optional Haar validation (costly)
+            if AI_FACE_HAAR_VALIDATE and new_faces:
+                gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                haar_faces = face_cascade.detectMultiScale(
+                    gray_full, scaleFactor=1.1, minNeighbors=AI_HAAR_MIN_NEIGHBORS, minSize=(AI_HAAR_MIN_SIZE_PX, AI_HAAR_MIN_SIZE_PX), maxSize=(int(w*0.6), int(h*0.6))
+                )
+                validated = []
+                for (x1, y1, x2, y2) in new_faces:
+                    for (hx, hy, hw, hh) in haar_faces:
+                        overlap_x1 = max(x1, hx); overlap_y1 = max(y1, hy)
+                        overlap_x2 = min(x2, hx + hw); overlap_y2 = min(y2, hy + hh)
+                        if overlap_x1 < overlap_x2 and overlap_y1 < overlap_y2:
+                            validated.append((x1, y1, x2, y2)); break
+                _last_faces = validated if validated else new_faces
+            else:
+                _last_faces = new_faces
+            # If nothing found and allowed, try full-res second pass
+            if not _last_faces and AI_FACE_DETECT_AT_FULLRES_WHEN_EMPTY and scale_det != 1.0:
+                with _mp_face_lock:
+                    results_full = face_detection.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                new_faces2 = []
+                if results_full.detections:
+                    for detection in results_full.detections:
+                        bbox = detection.location_data.relative_bounding_box
+                        if not is_valid_face_detection(bbox, w, h):
+                            continue
+                        if hasattr(detection, 'score') and len(detection.score) > 0:
+                            confidence = detection.score[0]
+                            if confidence < AI_FACE_CONF:
+                                continue
+                        x1 = max(0, int(bbox.xmin * w)); y1 = max(0, int(bbox.ymin * h))
+                        x2 = min(w, int((bbox.xmin + bbox.width) * w)); y2 = min(h, int((bbox.ymin + bbox.height) * h))
+                        if AI_FACE_HAAR_VALIDATE:
+                            roi = frame[y1:y2, x1:x2]
+                            if roi.size == 0 or not _verify_face_roi(roi):
+                                continue
+                        mx = int((x2 - x1) * AI_BOX_MARGIN); my = int((y2 - y1) * AI_BOX_MARGIN)
+                        x1 = max(0, x1 - mx); y1 = max(0, y1 - my)
+                        x2 = min(w, x2 + mx); y2 = min(h, y2 + my)
+                        new_faces2.append((x1, y1, x2, y2))
+                if new_faces2:
+                    _last_faces = new_faces2
+            # If still nothing, try Haar-only fallback
+            if not _last_faces and AI_FACE_SECOND_PASS_HAAR:
+                gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                haar_faces = face_cascade.detectMultiScale(
+                    gray_full, scaleFactor=1.1, minNeighbors=AI_HAAR_MIN_NEIGHBORS, minSize=(AI_HAAR_MIN_SIZE_PX, AI_HAAR_MIN_SIZE_PX), maxSize=(int(w*0.8), int(h*0.8))
+                )
+                new_faces3 = []
+                for (hx, hy, hw, hh) in haar_faces:
+                    mx = int(hw * AI_BOX_MARGIN); my = int(hh * AI_BOX_MARGIN)
+                    x1 = max(0, hx - mx); y1 = max(0, hy - my)
+                    x2 = min(w, hx + hw + mx); y2 = min(h, hy + hh + my)
+                    new_faces3.append((x1, y1, x2, y2))
+                if new_faces3:
+                    _last_faces = new_faces3
+        if not _last_faces and AI_USE_HOG_PERSON_FALLBACK:
+            global _hog
+            if _hog is None:
+                _hog = cv2.HOGDescriptor(); _hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+            rects, _ = _hog.detectMultiScale(frame, winStride=(8, 8), padding=(8, 8), scale=1.05)
+            head_boxes = []
+            for (px, py, pw, ph) in rects:
+                head_h = int(ph * AI_HOG_HEAD_RATIO_TOP)
+                x1 = max(0, px); y1 = max(0, py)
+                x2 = min(w, px + pw); y2 = min(h, py + head_h)
+                if (x2 - x1) >= AI_FACE_MIN_SIZE_PX and (y2 - y1) >= AI_FACE_MIN_SIZE_PX:
+                    head_boxes.append((x1, y1, x2, y2))
+            if head_boxes:
+                _last_faces = head_boxes
+        detected_boxes = list(_last_faces) if do_face else []
+        _update_head_tracks(detected_boxes, decay=(1 if do_face else 0))
+        if AI_FLOW_ENABLED and flow_gray_small is not None:
+            _flow_update_tracks(flow_gray_small, flow_scale)
+        faces_to_use = [tr["box"] for tr in _head_tracks]
+        faces_to_use = _nms_boxes(faces_to_use, thr=0.5)
+
+    if faces_to_use:
+        for (x1, y1, x2, y2) in faces_to_use:
+            h_box = y2 - y1
+            expand_top = int(h_box * AI_HEAD_EXPAND_TOP_RATIO)
+            y1e = max(0, y1 - expand_top)
+            w_box = x2 - x1
+            expand_x = int(w_box * AI_HEAD_EXPAND_X_RATIO)
+            x1e = max(0, x1 - expand_x)
+            x2e = min(frame.shape[1], x2 + expand_x)
+            roi = frame[y1e:y2, x1e:x2e]
+            if roi.size > 0:
+                frame[y1e:y2, x1e:x2e] = fast_pixelate(roi.copy(), scale=AI_PIXELATE_SCALE)
+    faces_count = len(faces_to_use)
+    faces_fresh = len(detected_boxes) if do_face else 0
+    return frame, {"faces": faces_count, "faces_fresh": faces_fresh}
+
+
+def process_frame_with_meta(frame, mode="face"):
+    """모드에 관계없이 얼굴 모자이크 + 메타(얼굴 수, 신선 검출 수)만 반환한다.
+    반환: (processed_frame, {faces, faces_fresh})
+    """
+    return detect_and_blur_meta(frame, blur_face=True)
