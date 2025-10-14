@@ -1,17 +1,2 @@
-# 시간 기반 얼굴 검출 API 의존성 패키지
+-r ../requirements.txt
 
-# FastAPI 및 웹 서버
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-python-multipart>=0.0.6
-
-# 컴퓨터 비전 및 얼굴 인식
-opencv-python>=4.8.0
-ultralytics>=8.0.0
-
-# 데이터 처리
-numpy>=1.24.0
-Pillow>=10.0.0
-
-# 유틸리티
-python-dateutil>=2.8.0
