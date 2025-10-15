@@ -1,6 +1,6 @@
 # Single source of truth for dependencies (pinned)
 
-numpy==1.24.3
+numpy==1.26.4
 opencv-python==4.8.1.78
 fastapi==0.116.1
 uvicorn[standard]==0.30.6
