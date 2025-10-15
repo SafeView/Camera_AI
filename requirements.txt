@@ -12,5 +12,5 @@ python-multipart==0.0.18
 ultralytics==8.3.30
 mediapipe==0.10.21
 Pillow==10.4.0
-torch==2.5.2
-torchvision==0.20.1
+torch==2.5.0
+
