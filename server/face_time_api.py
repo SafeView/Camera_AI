@@ -1,7 +1,8 @@
 from __future__ import annotations
 import os, cv2, json, shutil, base64, tempfile, time
+import re
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import List
 from fastapi import APIRouter, UploadFile, File, Query, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from .config import (
@@ -21,6 +22,27 @@ face_bboxes: List[List[int]] = []
 # 디렉토리 보장
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(API_RESULTS_DIR, exist_ok=True)
+
+MAX_FILENAME_LENGTH = 255  # 파일 이름 최대 길이 제한
+
+# 임시 파일명 생성 시 너무 긴 파일명으로 인한 OSError 방지용 헬퍼
+def _safe_temp_path(prefix: str, original_name: str | None, max_base_len: int = 120) -> str:
+    """원본 파일명을 안전한 형태로 바꿔서 임시 경로를 반환합니다.
+    - 디렉토리 구분자 제거
+    - 허용 문자 외는 '_'로 치환
+    - 기본 길이(max_base_len) 초과 시 확장자 보존하여 잘라냄
+    """
+    base = os.path.basename(original_name or 'file')
+    # 허용 문자만 남기기
+    safe = re.sub(r'[^A-Za-z0-9._-]', '_', base)
+    name, ext = os.path.splitext(safe)
+    # 확장자 포함해서 너무 길면 name을 잘라냄
+    if len(name) + len(ext) > max_base_len:
+        keep = max(1, max_base_len - len(ext))
+        name = name[:keep]
+    safe_name = f"{name}{ext}" if ext else name
+    path = os.path.join(tempfile.gettempdir(), f"{prefix}_{int(time.time())}_{safe_name}")
+    return path
 
 def initialize_face_detector():  # pragma: no cover (heavy)
     global face_detector
@@ -260,15 +282,22 @@ async def root():
     return {"message": "시간 기반 얼굴 검출 API", "version": "1.0.0"}
 
 @router.post('/upload-video')
-async def upload_video(file: UploadFile = File(...)):
+async def upload_video(file: UploadFile):
     if not validate_video_file(file.filename):
         raise HTTPException(status_code=400, detail='지원하지 않는 비디오 형식')
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f"{ts}_{file.filename}"
-    path = os.path.join(UPLOAD_DIR, filename)
-    with open(path, 'wb') as bf:
-        shutil.copyfileobj(file.file, bf)
-    return {"message": "비디오 업로드 성공", "filename": filename, "file_path": path}
+
+    # 파일 이름 길이 확인
+    if len(file.filename) > MAX_FILENAME_LENGTH:
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{ts}_{file.filename}"
+        path = os.path.join(UPLOAD_DIR, filename)
+        with open(path, 'wb') as bf:
+            shutil.copyfileobj(file.file, bf)
+        return {"message": "파일 이름이 길어 로컬에 저장되었습니다.", "filename": filename, "file_path": path}
+
+    # 파일 이름이 길지 않으면 메모리에서 처리
+    video_data = await file.read()
+    return {"message": "비디오 업로드 성공", "filename": file.filename, "size": len(video_data)}
 
 @router.post('/detect-faces')
 async def detect_faces(
@@ -293,7 +322,7 @@ async def detect_faces(
         if video_url.startswith('blob:'):
             if file is None:
                 raise HTTPException(status_code=400, detail='blob: URL은 직접 업로드 필요')
-            temp_path = os.path.join(tempfile.gettempdir(), f"upload_{int(time.time())}_{file.filename or 'video'}.mp4")
+            temp_path = _safe_temp_path('upload', file.filename or 'video')
             with open(temp_path,'wb') as bf: shutil.copyfileobj(file.file, bf)
             file_path=temp_path; temp_created=True
         elif video_url.startswith('data:'):
@@ -322,14 +351,14 @@ async def detect_faces(
             raise HTTPException(status_code=400, detail='S3 미설정')
         try:
             s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=f'recordings/{filename}')
-            temp_file = os.path.join(tempfile.gettempdir(), f"temp_{filename}")
+            temp_file = _safe_temp_path('temp', filename)
             s3_client.download_file(S3_BUCKET_NAME, f'recordings/{filename}', temp_file)
             file_path=temp_file
         except Exception:
             raise HTTPException(status_code=404, detail='S3에서 파일 없음')
     else:
         if file is not None:
-            temp_path = os.path.join(tempfile.gettempdir(), f"upload_{int(time.time())}_{file.filename or 'video'}.mp4")
+            temp_path = _safe_temp_path('upload', file.filename or 'video')
             with open(temp_path,'wb') as bf: shutil.copyfileobj(file.file, bf)
             file_path=temp_path; temp_created=True
         elif not filename:
@@ -339,10 +368,13 @@ async def detect_faces(
             if not os.path.exists(path):
                 raise HTTPException(status_code=404, detail='업로드 비디오 없음')
             file_path=path
+
     result = detect_faces_at_time(file_path, start_minutes, start_seconds)
     if temp_created and file_path and os.path.exists(file_path):
-        try: os.remove(file_path)
-        except Exception: pass
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
     if 'error' in result:
         return JSONResponse(content=result, status_code=400)
     return result
@@ -393,4 +425,3 @@ async def list_results():
     return {"results": out}
 
 __all__ = ['router']
-
