@@ -1,6 +1,6 @@
 # Single source of truth for dependencies (pinned)
 
-numpy==1.24.3
+numpy==1.26.4
 opencv-python==4.8.1.78
 fastapi==0.116.1
 uvicorn[standard]==0.30.6
@@ -8,9 +8,9 @@ boto3==1.40.13
 python-dotenv==1.0.1
 requests==2.32.4
 aiohttp==3.12.15
-python-multipart==0.0.9
+python-multipart==0.0.18
 ultralytics==8.3.30
-mediapipe==0.10.21
+mediapipe==0.10.18
 Pillow==10.4.0
-torch==2.5.1
-torchvision==0.20.1
+torch==2.5.0
+
