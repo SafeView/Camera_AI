@@ -230,20 +230,3 @@ async def analyze_video(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"분석 중 오류가 발생했습니다: {str(e)}")
 
 
-@router.get("/analyze-local")
-async def analyze_local_video(video_path: str):
-    """로컬 파일 경로로 분석 (개발/테스트용)"""
-    
-    if not os.path.exists(video_path):
-        raise HTTPException(status_code=404, detail=f"파일을 찾을 수 없습니다: {video_path}")
-    
-    try:
-        result = person_timing_analyzer.analyze_video(video_path)
-        
-        if "error" in result:
-            raise HTTPException(status_code=500, detail=result["error"])
-        
-        return JSONResponse(content=result)
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"분석 중 오류가 발생했습니다: {str(e)}")
