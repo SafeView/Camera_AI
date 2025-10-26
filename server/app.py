@@ -20,6 +20,7 @@ from .recording import router as recording_router
 from .verification import router as verification_router
 from .face_time_api import router as face_time_router
 from .person_timing import router as person_timing_router
+from .face_recognition_timing import router as face_recognition_timing_router
 from .core import state
 from .config import (
     AUTO_RECORD_ENABLED, AUTO_RECORD_THRESHOLD, AUTO_ZERO_TIMEOUT_SEC, AUTO_RECORD_DEBUG,
@@ -60,6 +61,7 @@ app.include_router(recording_router)
 app.include_router(verification_router)
 app.include_router(face_time_router)
 app.include_router(person_timing_router)
+app.include_router(face_recognition_timing_router)
 
 meta_router = APIRouter()
 
